@@ -85,6 +85,15 @@ typedef struct {
 	} u;
 } Packet;
 
+/* Byte queue used for non-blocking, buffered I/O on every hot-path fd
+ * (pty<->client sockets, client<->terminal). Pending bytes are data[off..len). */
+typedef struct {
+	char  *data;
+	size_t len;   /* total valid bytes                              */
+	size_t off;   /* already-drained prefix; pending == len - off   */
+	size_t cap;   /* allocated capacity                             */
+} Buffer;
+
 typedef struct Client Client;
 struct Client {
 	int socket;
@@ -99,6 +108,9 @@ struct Client {
 		CLIENT_READONLY = 1 << 0,
 		CLIENT_LOWPRIORITY = 1 << 1,
 	} flags;
+	Buffer out;        /* server -> this client, pending output bytes  */
+	Buffer in;         /* this client -> server, partial input frames  */
+	bool exit_queued;  /* MSG_EXIT already appended to out             */
 	Client *next;
 };
 
@@ -179,13 +191,6 @@ static ssize_t read_all(int fd, char *buf, size_t len) {
 	return ret;
 }
 
-static bool send_packet(int socket, Packet *pkt) {
-	size_t size = packet_size(pkt);
-	if (size > sizeof(*pkt))
-		return false;
-	return write_all(socket, (char *)pkt, size) == size;
-}
-
 static bool recv_packet(int socket, Packet *pkt) {
 	ssize_t len = read_all(socket, (char*)pkt, packet_header_size());
 	if (len <= 0 || len != packet_header_size())
@@ -201,6 +206,109 @@ static bool recv_packet(int socket, Packet *pkt) {
 	}
 	return true;
 }
+
+/* ------------------------------------------------------------------ *
+ *  Non-blocking buffered I/O                                          *
+ *                                                                     *
+ *  abduco 0.6 wrote each pty packet straight to every client socket   *
+ *  with a busy-spin write_all(); a slow consumer (the terminal) then  *
+ *  back-pressured through the non-blocking socket and pinned a CPU,   *
+ *  stalling the whole loop.  Here every hot-path fd drains through a   *
+ *  Buffer with proper EAGAIN handling and select() write-readiness,   *
+ *  and reads are reassembled so a packet split across two reads is    *
+ *  no longer mistaken for a disconnect.                               *
+ * ------------------------------------------------------------------ */
+
+static size_t buffer_pending(const Buffer *b) {
+	return b->len - b->off;
+}
+
+static bool buffer_append(Buffer *b, const char *data, size_t len) {
+	if (len == 0)
+		return true;
+	if (b->off > 0) {                 /* reclaim the already-drained prefix */
+		memmove(b->data, b->data + b->off, b->len - b->off);
+		b->len -= b->off;
+		b->off = 0;
+	}
+	if (b->len + len > b->cap) {
+		size_t ncap = b->cap ? b->cap : 4096;
+		while (ncap < b->len + len)
+			ncap *= 2;
+		char *nd = realloc(b->data, ncap);
+		if (!nd)
+			return false;
+		b->data = nd;
+		b->cap = ncap;
+	}
+	memcpy(b->data + b->len, data, len);
+	b->len += len;
+	return true;
+}
+
+/* Drain as much as fd accepts without blocking.
+ * Returns 0 on success or would-block, -1 on a hard error. */
+static int buffer_flush(Buffer *b, int fd) {
+	while (b->off < b->len) {
+		ssize_t w = write(fd, b->data + b->off, b->len - b->off);
+		if (w > 0) {
+			b->off += w;
+		} else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			break;                    /* fd full: retry on next wakeup */
+		} else if (w < 0 && errno == EINTR) {
+			continue;
+		} else {
+			return -1;                /* hard error (or write returned 0) */
+		}
+	}
+	if (b->off == b->len)
+		b->off = b->len = 0;          /* fully drained: rewind to front */
+	return 0;
+}
+
+static void buffer_free(Buffer *b) {
+	free(b->data);
+	b->data = NULL;
+	b->len = b->off = b->cap = 0;
+}
+
+/* Append whatever is readable on fd to r (non-blocking).
+ * Returns 1 = read some bytes, 0 = would-block, -1 = EOF or error. */
+static int reader_fill(Buffer *r, int fd) {
+	char tmp[4096];
+	ssize_t n = read(fd, tmp, sizeof tmp);
+	if (n > 0)
+		return buffer_append(r, tmp, n) ? 1 : -1;
+	if (n == 0)
+		return -1;
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+		return 0;
+	return -1;
+}
+
+/* Pop one complete packet out of r.
+ * Returns 1 = got a packet, 0 = need more bytes, -1 = framing error. */
+static int reader_next(Buffer *r, Packet *pkt) {
+	size_t hdr = packet_header_size();
+	if (buffer_pending(r) < hdr)
+		return 0;
+	memcpy(pkt, r->data + r->off, hdr);
+	if (pkt->len > sizeof(pkt->u.msg))
+		return -1;
+	size_t need = hdr + pkt->len;
+	if (buffer_pending(r) < need)
+		return 0;
+	if (pkt->len > 0)
+		memcpy(pkt->u.msg, r->data + r->off + hdr, pkt->len);
+	r->off += need;
+	if (r->off == r->len)
+		r->off = r->len = 0;
+	return 1;
+}
+
+/* Output back-pressure thresholds. */
+#define OUTBUF_HIGHWATER   (256 * 1024)      /* throttle the app above this  */
+#define OUTBUF_LOWPRIO_CAP (4 * 1024 * 1024) /* observers go lossy past this */
 
 #include "client.c"
 #include "server.c"

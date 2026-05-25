@@ -98,23 +98,26 @@ static bool server_write_pty(Packet *pkt) {
 	return false;
 }
 
-static bool server_recv_packet(Client *c, Packet *pkt) {
-	if (recv_packet(c->socket, pkt)) {
-		print_packet("server-recv:", pkt);
+/* Queue a packet for delivery to a client; never blocks. For low-priority
+ * observers the queue is bounded and whole frames are dropped past the cap,
+ * so a slow observer can neither stall the session nor corrupt its framing
+ * (we only ever drop entire packets, never a partial frame). */
+static bool server_enqueue_packet(Client *c, Packet *pkt) {
+	print_packet("server-queue:", pkt);
+	if ((c->flags & CLIENT_LOWPRIORITY) &&
+	    buffer_pending(&c->out) > OUTBUF_LOWPRIO_CAP)
 		return true;
+	if (!buffer_append(&c->out, (char *)pkt, packet_size(pkt))) {
+		c->state = STATE_DISCONNECTED;
+		return false;
 	}
-	debug("server-recv: FAILED\n");
-	c->state = STATE_DISCONNECTED;
-	return false;
+	return true;
 }
 
-static bool server_send_packet(Client *c, Packet *pkt) {
-	print_packet("server-send:", pkt);
-	if (send_packet(c->socket, pkt))
-		return true;
-	debug("FAILED\n");
-	c->state = STATE_DISCONNECTED;
-	return false;
+/* Drain a client's pending output as far as the socket allows; never blocks. */
+static void server_flush_client(Client *c) {
+	if (buffer_pending(&c->out) > 0 && buffer_flush(&c->out, c->socket) == -1)
+		c->state = STATE_DISCONNECTED;
 }
 
 static void server_pty_died_handler(int sig) {
@@ -156,7 +159,8 @@ static Client *server_accept_client(void) {
 		.len = sizeof pkt.u.l,
 		.u.l = getpid(),
 	};
-	server_send_packet(c, &pkt);
+	server_enqueue_packet(c, &pkt);
+	server_flush_client(c);
 
 	return c;
 error:
@@ -178,23 +182,75 @@ static void server_atexit_handler(void) {
 	unlink(sockaddr.sun_path);
 }
 
+/* Pull new output from the pty only while every interactive (non-observer)
+ * client can still accept it. This back-pressures a flooding application to
+ * the speed of the slowest real terminal without ever busy-spinning. With no
+ * clients attached we still drain (and discard) so a detached app does not
+ * block on a full pty. */
+static bool server_should_read_pty(void) {
+	if (!server.running || !server.read_pty)
+		return false;
+	for (Client *c = server.clients; c; c = c->next) {
+		if (c->flags & CLIENT_LOWPRIORITY)
+			continue;
+		if (buffer_pending(&c->out) > OUTBUF_HIGHWATER)
+			return false;
+	}
+	return true;
+}
+
+static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
+	switch (pkt->type) {
+	case MSG_CONTENT:
+		server_write_pty(pkt);
+		break;
+	case MSG_ATTACH:
+		c->flags = pkt->u.i;
+		if (c->flags & CLIENT_LOWPRIORITY)
+			server_sink_client();
+		break;
+	case MSG_RESIZE:
+		c->state = STATE_ATTACHED;
+		if (!(c->flags & CLIENT_READONLY) && c == server.clients) {
+			debug("server-ioct: TIOCSWINSZ\n");
+			struct winsize ws = { 0 };
+			ws.ws_row = pkt->u.ws.rows;
+			ws.ws_col = pkt->u.ws.cols;
+			ioctl(server.pty, TIOCSWINSZ, &ws);
+		}
+		kill(-server.pid, SIGWINCH);
+		break;
+	case MSG_EXIT:
+		*exit_delivered = true;
+		/* fall through */
+	case MSG_DETACH:
+		c->state = STATE_DISCONNECTED;
+		break;
+	default: /* ignore unknown packet */
+		break;
+	}
+}
+
 static void server_mainloop(void) {
 	atexit(server_atexit_handler);
-	fd_set new_readfds, new_writefds;
-	FD_ZERO(&new_readfds);
-	FD_ZERO(&new_writefds);
-	FD_SET(server.socket, &new_readfds);
-	int new_fdmax = server.socket;
 	bool exit_packet_delivered = false;
 
-	if (server.read_pty)
-		FD_SET_MAX(server.pty, &new_readfds, new_fdmax);
-
 	while (server.clients || !exit_packet_delivered) {
-		int fdmax = new_fdmax;
-		fd_set readfds = new_readfds;
-		fd_set writefds = new_writefds;
-		FD_SET_MAX(server.socket, &readfds, fdmax);
+		fd_set readfds, writefds;
+		FD_ZERO(&readfds);
+		FD_ZERO(&writefds);
+		int fdmax = server.socket;
+		FD_SET(server.socket, &readfds);
+
+		bool read_pty = server_should_read_pty();
+		if (read_pty)
+			FD_SET_MAX(server.pty, &readfds, fdmax);
+
+		for (Client *c = server.clients; c; c = c->next) {
+			FD_SET_MAX(c->socket, &readfds, fdmax);
+			if (buffer_pending(&c->out) > 0)
+				FD_SET_MAX(c->socket, &writefds, fdmax);
+		}
 
 		if (select(fdmax+1, &readfds, &writefds, NULL, NULL) == -1) {
 			if (errno == EINTR)
@@ -202,93 +258,71 @@ static void server_mainloop(void) {
 			die("server-mainloop");
 		}
 
-		FD_ZERO(&new_readfds);
-		FD_ZERO(&new_writefds);
-		new_fdmax = server.socket;
-
-		bool pty_data = false;
-
-		Packet server_packet, client_packet;
-
 		if (FD_ISSET(server.socket, &readfds))
 			server_accept_client();
 
-		if (FD_ISSET(server.pty, &readfds))
+		bool pty_data = false;
+		Packet server_packet;
+		if (read_pty && FD_ISSET(server.pty, &readfds))
 			pty_data = server_read_pty(&server_packet);
 
 		for (Client **prev_next = &server.clients, *c = server.clients; c;) {
-			if (FD_ISSET(c->socket, &readfds) && server_recv_packet(c, &client_packet)) {
-				switch (client_packet.type) {
-				case MSG_CONTENT:
-					server_write_pty(&client_packet);
-					break;
-				case MSG_ATTACH:
-					c->flags = client_packet.u.i;
-					if (c->flags & CLIENT_LOWPRIORITY)
-						server_sink_client();
-					break;
-				case MSG_RESIZE:
-					c->state = STATE_ATTACHED;
-					if (!(c->flags & CLIENT_READONLY) && c == server.clients) {
-						debug("server-ioct: TIOCSWINSZ\n");
-						struct winsize ws = { 0 };
-						ws.ws_row = client_packet.u.ws.rows;
-						ws.ws_col = client_packet.u.ws.cols;
-						ioctl(server.pty, TIOCSWINSZ, &ws);
-					}
-					kill(-server.pid, SIGWINCH);
-					break;
-				case MSG_EXIT:
-					exit_packet_delivered = true;
-					/* fall through */
-				case MSG_DETACH:
+			/* client input -> us, resilient to partial frames */
+			if (FD_ISSET(c->socket, &readfds)) {
+				if (reader_fill(&c->in, c->socket) < 0) {
 					c->state = STATE_DISCONNECTED;
-					break;
-				default: /* ignore package */
-					break;
+				} else {
+					Packet in;
+					int got;
+					while ((got = reader_next(&c->in, &in)) == 1)
+						server_handle_packet(c, &in, &exit_packet_delivered);
+					if (got < 0)
+						c->state = STATE_DISCONNECTED;
 				}
 			}
+
+			/* fan fresh pty output out to this client's queue */
+			if (pty_data && c->state != STATE_DISCONNECTED)
+				server_enqueue_packet(c, &server_packet);
+
+			/* once the app has exited and the status is known, queue a
+			 * single MSG_EXIT after the client's remaining output */
+			if (!server.running && !c->exit_queued &&
+			    server.exit_status != -1 && c->state != STATE_DISCONNECTED) {
+				Packet pkt = {
+					.type = MSG_EXIT,
+					.u.i = server.exit_status,
+					.len = sizeof(pkt.u.i),
+				};
+				server_enqueue_packet(c, &pkt);
+				c->exit_queued = true;
+			}
+
+			/* opportunistic non-blocking drain */
+			if (c->state != STATE_DISCONNECTED)
+				server_flush_client(c);
 
 			if (c->state == STATE_DISCONNECTED) {
 				bool first = (c == server.clients);
 				Client *t = c->next;
+				buffer_free(&c->out);
+				buffer_free(&c->in);
 				client_free(c);
 				*prev_next = c = t;
 				if (first && server.clients) {
-					Packet pkt = {
-						.type = MSG_RESIZE,
-						.len = 0,
-					};
-					server_send_packet(server.clients, &pkt);
+					/* promote the next client: make it redraw */
+					Packet pkt = { .type = MSG_RESIZE, .len = 0 };
+					server_enqueue_packet(server.clients, &pkt);
+					server_flush_client(server.clients);
 				} else if (!server.clients) {
 					server_mark_socket_exec(false, true);
 				}
 				continue;
 			}
 
-			FD_SET_MAX(c->socket, &new_readfds, new_fdmax);
-
-			if (pty_data)
-				server_send_packet(c, &server_packet);
-			if (!server.running) {
-				if (server.exit_status != -1) {
-					Packet pkt = {
-						.type = MSG_EXIT,
-						.u.i = server.exit_status,
-						.len = sizeof(pkt.u.i),
-					};
-					if (!server_send_packet(c, &pkt))
-						FD_SET_MAX(c->socket, &new_writefds, new_fdmax);
-				} else {
-					FD_SET_MAX(c->socket, &new_writefds, new_fdmax);
-				}
-			}
 			prev_next = &c->next;
 			c = c->next;
 		}
-
-		if (server.running && server.read_pty)
-			FD_SET_MAX(server.pty, &new_readfds, new_fdmax);
 	}
 
 	exit(EXIT_SUCCESS);
