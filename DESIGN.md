@@ -62,10 +62,10 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
 ## Known limitations (revisit later)
 - Alternate-screen wrapper removed (resolved): the host terminal now owns
   scrollback. After a reattach replay, how far you can actually scroll back is
-  capped by the terminal's own scrollback depth (e.g. Alacritty
-  scrolling.history, default 10000 lines) — replaying more just scrolls off the
-  top. Bump that setting to scroll further; the full byte history is kept in
-  the ring regardless.
+  capped by the terminal's own scrollback depth (macOS Terminal.app: Settings >
+  Profiles > Window > Scrollback; Windows console: Properties > Layout > Screen
+  Buffer Size height) — replaying more just scrolls off the top. Raise that to
+  scroll further; the full byte history is kept in the ring regardless.
 - Replaying a full 256 MB ring on reattach streams at terminal speed (~1-2 s
   worst case on a fast GPU terminal); typical sessions replay instantly. For
   alt-screen apps most of the ring is superseded frames — harmless but replayed.
