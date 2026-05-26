@@ -3,6 +3,8 @@ static Buffer client_srv;   /* terminal -> server   (input)            */
 static Buffer client_in;    /* server  -> client    (partial frames)   */
 static int client_stdin_flags  = -1;
 static int client_stdout_flags = -1;
+static bool alt_active = false;  /* the app has switched the real terminal
+                                  * to its alternate screen (?1049/?47/?1047) */
 
 static void client_sigwinch_handler(int sig) {
 	client.need_resize = true;
@@ -11,6 +13,36 @@ static void client_sigwinch_handler(int sig) {
 static void client_queue_to_server(Packet *pkt) {
 	print_packet("client-queue:", pkt);
 	buffer_append(&client_srv, (char *)pkt, packet_size(pkt));
+}
+
+/* Track alternate-screen state by sniffing the OUTPUT stream for
+ * ESC [ ? <n> (h|l) with n in {47,1047,1049}. A tiny state machine so the
+ * sequence may be split across packets. We never rewrite the stream; this is
+ * only so detach can return the user's terminal to a sane (primary) screen. */
+static void scan_altscreen(const char *p, size_t n) {
+	static int st = 0;   /* 0 ground, 1 ESC, 2 CSI, 3 CSI? */
+	static int num = 0;
+	for (size_t i = 0; i < n; i++) {
+		unsigned char ch = (unsigned char)p[i];
+		switch (st) {
+		case 0: if (ch == 0x1b) st = 1; break;
+		case 1: st = (ch == '[') ? 2 : (ch == 0x1b ? 1 : 0); break;
+		case 2:
+			if (ch == '?') { st = 3; num = 0; }
+			else st = (ch == 0x1b) ? 1 : 0;
+			break;
+		case 3:
+			if (ch >= '0' && ch <= '9') { num = num * 10 + (ch - '0'); }
+			else {
+				if (num == 1049 || num == 47 || num == 1047) {
+					if (ch == 'h') alt_active = true;
+					else if (ch == 'l') alt_active = false;
+				}
+				st = (ch == 0x1b) ? 1 : 0;
+			}
+			break;
+		}
+	}
 }
 
 /* Blocking control-path read, used by session_exists() on the freshly
@@ -37,11 +69,16 @@ static void client_restore_terminal(void) {
 		client_stdout_flags = -1;
 	}
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
-	if (alternate_buffer) {
-		printf("\033[?25h\033[?1049l");
-		fflush(stdout);
-		alternate_buffer = false;
+	/* leave the user's terminal sane: exit any app alternate screen, show the
+	 * cursor, reset attributes and scroll region, pop our window title. */
+	if (alt_active) {
+		printf("\033[?1049l");
+		alt_active = false;
 	}
+	printf("\033[?25h\033[0m\033[r");
+	if (server.session_name)
+		printf("\033[23;2t");
+	fflush(stdout);
 }
 
 static void client_setup_terminal(void) {
@@ -60,11 +97,14 @@ static void client_setup_terminal(void) {
 	cur_term.c_cc[VTIME] = 0;
 	tcsetattr(STDIN_FILENO, TCSANOW, &cur_term);
 
-	if (!alternate_buffer) {
-		printf("\033[?1049h\033[H");
-		fflush(stdout);
-		alternate_buffer = true;
-	}
+	/* No alternate screen: we stay on the primary screen so the host
+	 * terminal owns scrolling/scrollback. Reset scroll region, clear, and
+	 * push a window-title status. The server then replays the full history
+	 * into this (now native-scrollback) screen. */
+	printf("\033[r\033[H\033[2J");
+	if (server.session_name)
+		printf("\033[22;2t\033]2;mux: %s\007", server.session_name);
+	fflush(stdout);
 
 	/* From here the hot path uses non-blocking write()s drained through
 	 * client_out / client_srv, so a slow terminal can no longer block us.
@@ -176,8 +216,10 @@ static int client_mainloop(void) {
 				int got;
 				while ((got = reader_next(&client_in, &pkt)) == 1) {
 					if (pkt.type == MSG_CONTENT) {
-						if (!passthrough)
+						if (!passthrough) {
+							scan_altscreen(pkt.u.msg, pkt.len);
 							buffer_append(&client_out, pkt.u.msg, pkt.len);
+						}
 					} else if (pkt.type == MSG_RESIZE) {
 						client.need_resize = true;
 					} else if (pkt.type == MSG_EXIT) {

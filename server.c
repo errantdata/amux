@@ -120,6 +120,72 @@ static void server_flush_client(Client *c) {
 		c->state = STATE_DISCONNECTED;
 }
 
+/* ---- full-history ring -------------------------------------------------- *
+ * All pty output is appended here (even while detached). Each client holds a
+ * monotonic cursor (ring_pos) into the logical byte stream; the last RING_SIZE
+ * bytes are physically retained. A reattaching client starts at the oldest
+ * retained byte, so it replays the entire kept history before live output. */
+
+static void server_ring_init(void) {
+	server.ring_total = 0;
+	char tmpl[] = "/tmp/.mux-scrollback-XXXXXX";
+	int fd = mkstemp(tmpl);
+	if (fd != -1) {
+		unlink(tmpl);                 /* anonymous: cleaned up on exit */
+		if (ftruncate(fd, RING_SIZE) == 0) {
+			void *p = mmap(NULL, RING_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+			if (p != MAP_FAILED) {
+				server.ring = p;
+				close(fd);
+				return;
+			}
+		}
+		close(fd);
+	}
+	server.ring = malloc(RING_SIZE);  /* fallback: anonymous RAM */
+	if (!server.ring)
+		die("server-ring-init");
+}
+
+static uint64_t server_ring_oldest(void) {
+	return server.ring_total > RING_SIZE ? server.ring_total - RING_SIZE : 0;
+}
+
+/* Append live pty output to the ring (len <= one packet payload). */
+static void server_ring_record(const char *data, size_t len) {
+	size_t off = (size_t)(server.ring_total % RING_SIZE);
+	size_t first = RING_SIZE - off;
+	if (first > len)
+		first = len;
+	memcpy(server.ring + off, data, first);
+	if (len > first)
+		memcpy(server.ring, data + first, len - first);  /* wrap */
+	server.ring_total += len;
+}
+
+/* Feed a client from the ring (history then live, unified) until its output
+ * queue reaches the high-water mark or it has caught up to the write head. */
+static void server_pump_client(Client *c) {
+	uint64_t oldest = server_ring_oldest();
+	if (c->ring_pos < oldest)
+		c->ring_pos = oldest;             /* fell >RING_SIZE behind: skip gap */
+	while (c->ring_pos < server.ring_total &&
+	       buffer_pending(&c->out) < OUTBUF_HIGHWATER) {
+		size_t off = (size_t)(c->ring_pos % RING_SIZE);
+		uint64_t avail = server.ring_total - c->ring_pos;
+		size_t chunk = sizeof(((Packet *)0)->u.msg);
+		if (chunk > avail)
+			chunk = (size_t)avail;
+		if (chunk > RING_SIZE - off)
+			chunk = RING_SIZE - off;      /* don't span the physical wrap */
+		Packet pkt = { .type = MSG_CONTENT, .len = chunk };
+		memcpy(pkt.u.msg, server.ring + off, chunk);
+		if (!server_enqueue_packet(c, &pkt))
+			break;
+		c->ring_pos += chunk;
+	}
+}
+
 static void server_pty_died_handler(int sig) {
 	int errsv = errno;
 	pid_t pid;
@@ -150,6 +216,7 @@ static Client *server_accept_client(void) {
 		server_mark_socket_exec(true, true);
 	c->socket = newfd;
 	c->state = STATE_CONNECTED;
+	c->ring_pos = server_ring_oldest();   /* replay the full kept history */
 	c->next = server.clients;
 	server.clients = c;
 	server.read_pty = true;
@@ -182,18 +249,19 @@ static void server_atexit_handler(void) {
 	unlink(sockaddr.sun_path);
 }
 
-/* Pull new output from the pty only while every interactive (non-observer)
- * client can still accept it. This back-pressures a flooding application to
- * the speed of the slowest real terminal without ever busy-spinning. With no
- * clients attached we still drain (and discard) so a detached app does not
- * block on a full pty. */
+/* Pull new output from the pty unless a real (non-observer) client has fallen
+ * far enough behind in the ring that running ahead risks overwriting bytes it
+ * has not yet consumed. This back-pressures a flooding application to the
+ * speed of the slowest real terminal (and pauses it during a long replay)
+ * without ever busy-spinning. With no clients we keep draining into the ring
+ * so a detached app does not block and history keeps accumulating. */
 static bool server_should_read_pty(void) {
 	if (!server.running || !server.read_pty)
 		return false;
 	for (Client *c = server.clients; c; c = c->next) {
 		if (c->flags & CLIENT_LOWPRIORITY)
 			continue;
-		if (buffer_pending(&c->out) > OUTBUF_HIGHWATER)
+		if (server.ring_total - c->ring_pos > RING_LAG_HIGHWATER)
 			return false;
 	}
 	return true;
@@ -233,6 +301,7 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 
 static void server_mainloop(void) {
 	atexit(server_atexit_handler);
+	server_ring_init();
 	bool exit_packet_delivered = false;
 
 	while (server.clients || !exit_packet_delivered) {
@@ -261,10 +330,12 @@ static void server_mainloop(void) {
 		if (FD_ISSET(server.socket, &readfds))
 			server_accept_client();
 
-		bool pty_data = false;
-		Packet server_packet;
-		if (read_pty && FD_ISSET(server.pty, &readfds))
-			pty_data = server_read_pty(&server_packet);
+		/* live pty output goes into the ring; clients stream from the ring */
+		if (read_pty && FD_ISSET(server.pty, &readfds)) {
+			Packet server_packet;
+			if (server_read_pty(&server_packet))
+				server_ring_record(server_packet.u.msg, server_packet.len);
+		}
 
 		for (Client **prev_next = &server.clients, *c = server.clients; c;) {
 			/* client input -> us, resilient to partial frames */
@@ -281,14 +352,14 @@ static void server_mainloop(void) {
 				}
 			}
 
-			/* fan fresh pty output out to this client's queue */
-			if (pty_data && c->state != STATE_DISCONNECTED)
-				server_enqueue_packet(c, &server_packet);
+			/* stream ring -> this client (replay history, then live) */
+			if (c->state != STATE_DISCONNECTED)
+				server_pump_client(c);
 
-			/* once the app has exited and the status is known, queue a
-			 * single MSG_EXIT after the client's remaining output */
-			if (!server.running && !c->exit_queued &&
-			    server.exit_status != -1 && c->state != STATE_DISCONNECTED) {
+			/* once the app has exited, the status is known, and this client
+			 * has been sent everything, queue a single MSG_EXIT */
+			if (!server.running && !c->exit_queued && server.exit_status != -1 &&
+			    c->ring_pos >= server.ring_total && c->state != STATE_DISCONNECTED) {
 				Packet pkt = {
 					.type = MSG_EXIT,
 					.u.i = server.exit_status,
@@ -310,7 +381,7 @@ static void server_mainloop(void) {
 				client_free(c);
 				*prev_next = c = t;
 				if (first && server.clients) {
-					/* promote the next client: make it redraw */
+					/* promote the next client: make it resize/redraw */
 					Packet pkt = { .type = MSG_RESIZE, .len = 0 };
 					server_enqueue_packet(server.clients, &pkt);
 					server_flush_client(server.clients);

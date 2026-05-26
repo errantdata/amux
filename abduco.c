@@ -37,6 +37,7 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
 #if defined(__linux__) || defined(__CYGWIN__)
 # include <pty.h>
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
@@ -111,6 +112,7 @@ struct Client {
 	Buffer out;        /* server -> this client, pending output bytes  */
 	Buffer in;         /* this client -> server, partial input frames  */
 	bool exit_queued;  /* MSG_EXIT already appended to out             */
+	uint64_t ring_pos; /* next history byte to send to this client     */
 	Client *next;
 };
 
@@ -128,12 +130,14 @@ typedef struct {
 	const char *session_name;
 	char host[255];
 	bool read_pty;
+	char *ring;           /* circular history buffer (mmap or malloc)   */
+	uint64_t ring_total;  /* total bytes ever recorded (monotonic)      */
 } Server;
 
 static Server server = { .running = true, .exit_status = -1, .host = "@localhost" };
 static Client client;
 static struct termios orig_term, cur_term;
-static bool has_term, alternate_buffer, quiet, passthrough;
+static bool has_term, quiet, passthrough;
 
 static struct sockaddr_un sockaddr = {
 	.sun_family = AF_UNIX,
@@ -309,6 +313,12 @@ static int reader_next(Buffer *r, Packet *pkt) {
 /* Output back-pressure thresholds. */
 #define OUTBUF_HIGHWATER   (256 * 1024)      /* throttle the app above this  */
 #define OUTBUF_LOWPRIO_CAP (4 * 1024 * 1024) /* observers go lossy past this */
+
+/* Full-history ring: every client streams pty output from its own cursor
+ * into this circular buffer, so reattach replays the whole thing. */
+#define RING_SIZE          (256UL * 1024 * 1024) /* history kept per session */
+#define RING_LAG_HIGHWATER (1UL * 1024 * 1024)   /* throttle app if a real
+                                                  * client is this far behind */
 
 #include "client.c"
 #include "server.c"
