@@ -31,6 +31,11 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
    ours. (Opt-in exception: alt-screen sniffing for the status row, step 3.)
 2. NO BUSY-SPIN: every hot-path fd is non-blocking and drained via select
    write-readiness. EAGAIN means "try later", never "loop now".
+   Corollary (learned the hard way): ask select() for write readiness whenever
+   a client is *owed* bytes, not merely when its out buffer is non-empty. A
+   flush that fully drains the buffer otherwise leaves nothing to wake the
+   loop, and an idle application never wakes it either -- the client stalls
+   mid-replay. See server_client_owes_data().
 3. BACK-PRESSURE, DON'T DROP (real clients): if the terminal is slow, throttle
    the app through the pty. Only low-priority observers are lossy.
 4. RESPONSIVE UNDER LOAD: the detach key and resize must work while output is
@@ -108,6 +113,11 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
   detach. Pressing it as its own keystroke is instant regardless of backlog.
 - Read-side framing errors deliberately close the connection; large input reads
   are chunked to <=4080-byte frames.
+- A dump (-H) is a snapshot: its end point is the write head as it was when the
+  dump attached (Client.history_end). Chasing a live head instead means the
+  dump either stops early on a lucky catch-up or never terminates, which is
+  exactly the `amux -H session | less` case. tests/test_large_streams.py guards
+  both this and the select() wakeup rule below.
 
 ## Tunables (currently #defined in amux.c)
 - OUTBUF_HIGHWATER     256 KiB  — per-client output queue cap before pump pauses

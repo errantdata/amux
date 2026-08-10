@@ -124,6 +124,10 @@ struct Client {
 	bool attach_seen;  /* MSG_ATTACH processed: replay window is set   */
 	bool exit_queued;  /* MSG_EXIT/MSG_HISTORY_END already appended    */
 	uint64_t ring_pos; /* next history byte to send to this client     */
+	uint64_t history_end; /* CLIENT_HISTORY: write head at attach time.
+	                       * A dump is a snapshot: without a fixed end it
+	                       * chases a live writer, so it either stops early
+	                       * on a lucky catch-up or never finishes at all. */
 	Client *next;
 };
 

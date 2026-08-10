@@ -212,16 +212,32 @@ static uint64_t server_ring_replay_start(uint32_t lines, uint64_t bytes) {
 	return head - back;
 }
 
+/* The write head this client is streaming towards. */
+static uint64_t server_client_end(Client *c) {
+	return (c->flags & CLIENT_HISTORY) ? c->history_end : server.ring_total;
+}
+
+/* Does this client still have ring bytes owed to it? Used to ask select() for
+ * write readiness even when the out buffer is momentarily empty: a flush that
+ * drains it completely would otherwise leave nothing to wake the loop, and an
+ * idle application never wakes it either, stalling the client mid-replay. */
+static bool server_client_owes_data(Client *c) {
+	return c->attach_seen && c->ring_pos < server_client_end(c);
+}
+
 /* Feed a client from the ring (history then live, unified) until its output
  * queue reaches the high-water mark or it has caught up to the write head. */
 static void server_pump_client(Client *c) {
 	uint64_t oldest = server_ring_oldest();
 	if (c->ring_pos < oldest)
 		c->ring_pos = oldest;             /* fell >RING_SIZE behind: skip gap */
-	while (c->ring_pos < server.ring_total &&
+	/* A dump stops at the write head as it was when it attached; a live
+	 * client follows the head wherever it goes. */
+	uint64_t end = server_client_end(c);
+	while (c->ring_pos < end &&
 	       buffer_pending(&c->out) < OUTBUF_HIGHWATER) {
 		size_t off = (size_t)(c->ring_pos % RING_SIZE);
-		uint64_t avail = server.ring_total - c->ring_pos;
+		uint64_t avail = end - c->ring_pos;
 		size_t chunk = sizeof(((Packet *)0)->u.msg);
 		if (chunk > avail)
 			chunk = (size_t)avail;
@@ -335,6 +351,9 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 		else
 			c->ring_pos = server_ring_oldest();   /* legacy: full replay */
 		c->attach_seen = true;
+		/* Freeze the end point of a dump at attach time (see history_end). */
+		if (c->flags & CLIENT_HISTORY)
+			c->history_end = server.ring_total;
 		if (c->flags & (CLIENT_LOWPRIORITY|CLIENT_HISTORY))
 			server_sink_client();
 		break;
@@ -387,7 +406,7 @@ static void server_mainloop(void) {
 		for (Client *c = server.clients; c; c = c->next) {
 			if (!pty_backed_up)
 				FD_SET_MAX(c->socket, &readfds, fdmax);
-			if (buffer_pending(&c->out) > 0)
+			if (buffer_pending(&c->out) > 0 || server_client_owes_data(c))
 				FD_SET_MAX(c->socket, &writefds, fdmax);
 		}
 
@@ -435,7 +454,8 @@ static void server_mainloop(void) {
 			 * asked for. Gated on attach_seen: a client that has not yet
 			 * told us its replay window must never be finished off early. */
 			if (c->state != STATE_DISCONNECTED && c->attach_seen &&
-			    !c->exit_queued && c->ring_pos >= server.ring_total) {
+			    !c->exit_queued &&
+			    c->ring_pos >= server_client_end(c)) {
 				if (c->flags & CLIENT_HISTORY) {
 					Packet pkt = { .type = MSG_HISTORY_END, .len = 0 };
 					server_enqueue_packet(c, &pkt);
