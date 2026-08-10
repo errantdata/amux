@@ -90,8 +90,10 @@ def reattach(extra):
 
 # ---- create the session and let it produce N lines -------------------------
 # zero-padded so every line is the same width: byte counts below then track
-# line counts directly, instead of being skewed by the tail's longer numbers
-p1, m1 = spawn([AMUX, "-e", "^\\", "-c", "tF", "sh", "-c", f"seq -w 1 {N}; exec cat"])
+# line counts directly, instead of being skewed by the tail's longer numbers.
+# awk rather than `seq -w`, which busybox (Alpine) does not support.
+FILL = "awk 'BEGIN{for(i=1;i<=%d;i++) printf \"%%05d\\n\", i}'" % N
+p1, m1 = spawn([AMUX, "-e", "^\\", "-c", "tF", "sh", "-c", f"{FILL}; exec cat"])
 first = nums(drain(m1, 4.0))
 check("F0: session produced all %d lines" % N, first and max(first) == N,
       f"max={max(first) if first else None}")
