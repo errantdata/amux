@@ -99,7 +99,8 @@ brew install errantdata/tap/amux
 ### Prebuilt binary
 
 Each [release](https://github.com/errantdata/amux/releases) ships tarballs for
-linux-x86_64, linux-aarch64, macos-arm64 and macos-x86_64, plus `SHA256SUMS`.
+linux-x86_64, linux-aarch64 and macos-universal (Apple Silicon and Intel in one
+binary), plus `SHA256SUMS`.
 
 ```sh
 tar xzf amux-1.0.0-linux-x86_64.tar.gz

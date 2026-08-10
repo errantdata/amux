@@ -28,7 +28,7 @@ static void server_unlink_client(Client *c) {
 	}
 }
 
-static void server_sink_client() {
+static void server_sink_client(void) {
 	if (!server.clients || !server.clients->next)
 		return;
 	Client *target = server.clients;

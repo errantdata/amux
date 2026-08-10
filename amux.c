@@ -166,7 +166,7 @@ static void info(const char *str, ...);
 
 #include "debug.c"
 
-static inline size_t packet_header_size() {
+static inline size_t packet_header_size(void) {
 	return offsetof(Packet, u);
 }
 

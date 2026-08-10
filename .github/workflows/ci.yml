@@ -17,7 +17,6 @@ jobs:
           - ubuntu-latest      # x86_64 glibc
           - ubuntu-24.04-arm   # aarch64 glibc
           - macos-latest       # Apple Silicon
-          - macos-13           # Intel
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +35,20 @@ jobs:
         run: |
           make clean
           make CFLAGS_EXTRA="-Wall -Wextra -pedantic -Werror \
+                             -Wstrict-prototypes -Wold-style-definition \
+                             -Wmissing-prototypes \
                              -Wno-unused-parameter -Wno-sign-compare"
+
+      # The release builds one macOS tarball for both architectures; prove it
+      # works on every push rather than discovering it at tag time.
+      - name: Universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          make clean
+          make CFLAGS_EXTRA="-arch arm64 -arch x86_64"
+          file amux
+          file amux | grep -q "universal" || { echo "not a universal binary"; exit 1; }
+          make clean && make
 
       - name: Test
         run: make check

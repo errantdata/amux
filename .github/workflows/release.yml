@@ -25,9 +25,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: linux-aarch64
           - os: macos-latest
-            target: macos-arm64
-          - os: macos-13
-            target: macos-x86_64
+            target: macos-universal
+            # one tarball for Apple Silicon and Intel; the macos-13 runner
+            # that used to build the Intel half no longer schedules
+            cflags_extra: -arch arm64 -arch x86_64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +37,7 @@ jobs:
       - name: Build
         run: |
           ./configure
-          make
+          make CFLAGS_EXTRA="${{ matrix.cflags_extra }}"
           ./amux -v
 
       - name: Test
