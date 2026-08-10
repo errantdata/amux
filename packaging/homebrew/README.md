@@ -41,9 +41,9 @@ brew test amux
 brew audit --strict --online amux
 ```
 
-## Note on the repository name
+## If the repository ever moves
 
-The formula's `url` and `homepage` assume the project repo is named `amux`. If
-you keep the current `abduco-mux` name instead, change those two fields to
-match — Homebrew does not follow GitHub's rename redirects for `url`
-reliably, and a stale URL breaks installs.
+The formula pins three fields to the repository: `homepage`, `url` and `head`.
+Homebrew does not follow GitHub's rename redirects for `url` reliably, so a
+rename means updating all three — a stale `url` breaks installs rather than
+redirecting them.
