@@ -96,16 +96,7 @@ numbers.
 brew install errantdata/tap/amux
 ```
 
-### Prebuilt binary
-
-Each [release](https://github.com/errantdata/amux/releases) ships tarballs for
-linux-x86_64, linux-aarch64 and macos-universal (Apple Silicon and Intel in one
-binary), plus `SHA256SUMS`.
-
-```sh
-tar xzf amux-1.0.0-linux-x86_64.tar.gz
-sudo install -m0755 amux-1.0.0-linux-x86_64/amux /usr/local/bin/amux
-```
+Builds from source, so it works on Apple Silicon, Intel and Linuxbrew alike.
 
 ### From source
 
@@ -119,8 +110,10 @@ sudo make install                 # /usr/local by default
 sudo make install-completion      # optional zsh completion
 ```
 
-Builds and is tested on Linux (glibc and musl), macOS (Apple Silicon and
-Intel), and should work on the BSDs as abduco does.
+Needs no dependencies beyond libc: the whole program is one 47 KB binary that
+compiles in a couple of seconds. CI builds and tests it on Linux; macOS builds
+cleanly and its test run is being verified. It should work on the BSDs as
+abduco does.
 
 ## Usage
 

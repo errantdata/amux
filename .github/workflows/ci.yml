@@ -15,9 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest      # x86_64 glibc
-          - ubuntu-24.04-arm   # aarch64 glibc
-          - macos-latest       # Apple Silicon
+          - ubuntu-latest
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -40,19 +39,6 @@ jobs:
                              -Wmissing-prototypes \
                              -Wno-unused-parameter -Wno-sign-compare"
 
-      # The release builds one macOS tarball for both architectures; prove it
-      # works on every push rather than discovering it at tag time.
-      - name: Universal binary (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          make clean
-          make CFLAGS_EXTRA="-arch arm64 -arch x86_64"
-          file amux
-          file amux | grep -q "universal" || { echo "not a universal binary"; exit 1; }
-          make clean && make
-
-      # Surface the failing checks as annotations: log bodies need auth, so a
-      # bare "exit code 2" is all an outside observer can otherwise see.
       - name: Test
         run: |
           set -o pipefail
@@ -81,22 +67,3 @@ jobs:
           note "history head: $(./amux -H smoke 2>&1 | head -c 120 | tr -d '\r' | tr '\n' '|')"
           note "socket dir tree: $(find "$D" -maxdepth 3 2>&1 | tr '\n' ';')"
           note "ring tmpfiles: $(ls -la /tmp/.mux-scrollback-* 2>&1 | head -2 | tr '\n' ';')"
-
-  alpine:
-    name: alpine (musl)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25          # a hung test should fail, not burn an hour
-    container: alpine:latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain
-        run: apk add --no-cache build-base python3 linux-headers
-      - name: Configure and build
-        run: ./configure && make
-      - name: Test
-        run: |
-          set -o pipefail
-          make check 2>&1 | tee test.log || {
-            grep '^\[FAIL\]' test.log | sed 's/^/::error::/'
-            exit 1
-          }

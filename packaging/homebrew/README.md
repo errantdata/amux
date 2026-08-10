@@ -27,11 +27,16 @@ formula builds from source with the project's own `configure`/`make`.
 
 ## On each release
 
-1. Push the tag and let the Release workflow finish. The formula points at a
-   release asset, so it can only be published *after* the workflow uploads it.
-2. Take the source tarball's checksum from the release's `SHA256SUMS` — the
-   line for `amux-<version>.tar.gz`.
-3. In the tap, update the formula's `url` (new tag) and `sha256`, then commit.
+There is no release pipeline to wait for — tag, then hash the tag archive:
+
+```sh
+git tag -a v1.0.0 -m "amux 1.0.0" && git push origin v1.0.0
+curl -sL https://github.com/errantdata/amux/archive/refs/tags/v1.0.0.tar.gz \
+  | shasum -a 256
+```
+
+Put that tag and checksum into the formula's `url` and `sha256`, and commit it
+to the tap.
 
 To check a change before pushing it:
 
