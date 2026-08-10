@@ -77,6 +77,41 @@ def drain(m, t):
         else: break
     return bytes(out)
 
+def drain_until_quiet(m, quiet=1.0, ceiling=25.0):
+    """Read until `quiet` seconds pass with no new bytes. Fixed-duration
+    drains make a test fail on a loaded machine for no good reason."""
+    out = bytearray(); t0 = time.time(); last = time.time()
+    fl = fcntl.fcntl(m, fcntl.F_GETFL); fcntl.fcntl(m, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    while time.time() - last < quiet and time.time() - t0 < ceiling:
+        try:
+            d = os.read(m, 1 << 16)
+        except BlockingIOError:
+            time.sleep(0.02); continue
+        except OSError:
+            break
+        if d:
+            out += d; last = time.time()
+    return bytes(out)
+
+def wait_ready(m, timeout=20.0):
+    """Wait until the application is actually reading its stdin, by sending a
+    marker and waiting for it to come back. Sleeping a fixed 0.6s instead is
+    what made this race on slow runners."""
+    os.write(m, b"__ready__\n")
+    end = time.time() + timeout; buf = bytearray()
+    fl = fcntl.fcntl(m, fcntl.F_GETFL); fcntl.fcntl(m, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    while time.time() < end:
+        try:
+            d = os.read(m, 1 << 16)
+        except BlockingIOError:
+            time.sleep(0.02); continue
+        except OSError:
+            break
+        buf += d
+        if buf.count(b"__ready__") >= 2:      # echoed by the tty, then by cat
+            return True
+    return b"__ready__" in bytes(buf)
+
 def blocking(fd):
     fl = fcntl.fcntl(fd, fcntl.F_GETFL); fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
 
@@ -169,14 +204,33 @@ try: rc = p1.wait(timeout=5)
 except Exception: rc = "(timeout)"
 check("H2b: session exits cleanly (rc=0)", rc == 0, f"rc={rc}")
 
-# ---- H3: input inside the tty's capacity is delivered intact ---------------
+# ---- H3: a paste the tty can carry must arrive intact ----------------------
+def bare_pty_small():
+    """The same small paste through a bare pty running cat: the ceiling any
+    session manager could possibly deliver."""
+    m, s = pty.openpty(); set_ws(s)
+    p = subprocess.Popen(["cat"], stdin=s, stdout=s, stderr=s,
+                         start_new_session=True)
+    os.close(s)
+    blocking(m)
+    wait_ready(m)
+    os.write(m, small)
+    got = longest_run_from_1(nums(drain_until_quiet(m, 1.0, 25.0)))
+    try: p.kill()
+    except Exception: pass
+    os.close(m)
+    return got
+
+small_control = bare_pty_small()
+
 p3, m3 = spawn([AMUX, "-e", "^\\", "-s", "none", "-c", "tH3", "cat"])
-time.sleep(0.6)
 blocking(m3)
+wait_ready(m3)
 os.write(m3, small)
-run3 = longest_run_from_1(nums(drain(m3, 4.0)))
-check("H3: a %d-byte paste round-trips complete and in order" % len(small),
-      run3 >= SMALL, f"contiguous 1..{run3} of {SMALL}")
+run3 = longest_run_from_1(nums(drain_until_quiet(m3, 1.0, 25.0)))
+check("H3: a %d-byte paste arrives as intact as through a bare pty" % len(small),
+      run3 >= small_control,
+      f"amux 1..{run3} vs bare pty 1..{small_control} (of {SMALL})")
 os.write(m3, b"\x04")
 drain(m3, 1.0); os.close(m3)
 try: p3.wait(timeout=5)

@@ -61,6 +61,27 @@ jobs:
             exit 1
           }
 
+      # Log bodies need auth, so when something fails on a runner we cannot
+      # reproduce, push the facts out through annotations instead.
+      - name: Diagnose (only on failure)
+        if: failure()
+        run: |
+          note() { echo "::error::DIAG $*"; }
+          note "uname: $(uname -a)"
+          note "hostname: $(hostname) (${#HOSTNAME} chars)"
+          note "TMPDIR: ${TMPDIR:-unset}"
+          D=$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="diag."))')
+          note "mkdtemp: $D (${#D} chars)"
+          export AMUX_SOCKET_DIR="$D"
+          out=$(./amux -n smoke sh -c 'echo hello-smoke; sleep 5' 2>&1); rc=$?
+          note "create rc=$rc out='$out'"
+          sleep 2
+          note "list: $(./amux 2>&1 | tail -n +2 | tr '\n' ';')"
+          note "history bytes: $(./amux -H smoke 2>&1 | wc -c)"
+          note "history head: $(./amux -H smoke 2>&1 | head -c 120 | tr -d '\r' | tr '\n' '|')"
+          note "socket dir tree: $(find "$D" -maxdepth 3 2>&1 | tr '\n' ';')"
+          note "ring tmpfiles: $(ls -la /tmp/.mux-scrollback-* 2>&1 | head -2 | tr '\n' ';')"
+
   alpine:
     name: alpine (musl)
     runs-on: ubuntu-latest

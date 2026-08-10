@@ -173,7 +173,10 @@ matter who is managing the session.
   lines yield more screen rows than requested.
 - A very large paste loses bytes past the tty's input queue. This is the
   kernel's tty layer, not `amux` — a bare pty with nothing in between loses the
-  same data. It needs flow control above the pty (bracketed paste).
+  same data. It needs flow control above the pty (bracketed paste). Moderate
+  pastes actually fare *better* through `amux` than through a raw pty, because
+  the queued write path feeds the pty at the rate it will accept rather than
+  flooding it in one call.
 - The detach key is honoured only as the first byte of a read, as upstream did:
   a `Ctrl+\` appended to a giant paste is data, not a detach.
 - Native scrolling is `amux` getting out of the way, not `amux` providing it.

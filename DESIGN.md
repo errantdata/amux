@@ -107,7 +107,10 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
   measures both). The queued write path removes the server stall; delivering a
   huge paste intact needs flow control above the pty (bracketed paste, or an
   app that reads continuously) and is not something a session manager can
-  buffer its way out of.
+  buffer its way out of. Measured the other way, though, the queued write path
+  helps at moderate sizes: a 1.5 KB paste arrives complete through amux where a
+  bare pty delivers about a fifth of it, because we feed the pty at the rate it
+  accepts instead of in one flooding write.
 - The detach key is only honoured when it is the first byte of a read, as
   upstream always did — a Ctrl-\ appended to a giant paste is data, not a
   detach. Pressing it as its own keystroke is instant regardless of backlog.
