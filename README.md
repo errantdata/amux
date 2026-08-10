@@ -1,41 +1,68 @@
-# amux — terminal session detach/attach, with history that survives
+# amux — instant reattach, native scrolling
 
-`amux` runs a program independently of your terminal: detach, close the
-terminal, come back later, reattach. It is a fork of
-[abduco](https://www.brain-dump.org/projects/abduco) 0.6 by Marc André Tanner,
-and it keeps the thing that makes abduco good — it never redraws your screen —
-while fixing the two problems that made it painful for long-running,
-high-output sessions.
+`amux` keeps a program running when your terminal goes away: detach, close the
+laptop, drop the ssh connection, come back later and reattach. It exists to do
+two things its ancestors don't.
 
-Unlike tmux and screen, `amux` does not virtualize your terminal. It passes the
-application's bytes through untouched, so your colours are your colours, your
-mouse wheel scrolls your terminal's own scrollback, and there is no prefix key
-to fight. It manages one session, not windows and panes — pair it with
-[dvtm](https://www.brain-dump.org/projects/dvtm) if you want splits.
+## Reattach to a long-running session instantly
 
-## What this fork changes
+Coding agents and long builds emit enormous amounts of output. A day with a
+coding agent is tens of megabytes of scrollback, and the usual options both
+handle coming back to it badly: abduco replays nothing, so you reattach to a
+blank screen with your agent's last question gone, while replaying the whole
+buffer means watching it redraw — minutes of scrolling to reach the live prompt
+at the bottom.
 
-**Reattaching is instant, on any size of session.** abduco replays nothing on
-reattach; you come back to a blank screen. `amux` records *all* output —
-including while you were detached — into a 256 MB per-session ring, and on
-attach replays only the trailing part your terminal can actually retain
-(10,000 lines by default). Replaying more than that just scrolls off the top,
-at the cost of rendering every byte first. On a 43.9 MB session that is
-**0.09 MB pushed instead of 43.89 MB** — sub-second instead of minutes.
+`amux` records **all** output, including while you were detached, but on
+reattach it pushes only the part your terminal can actually keep. You land on
+the live prompt immediately, with real scrollback above it. On a 43.9 MB
+session that is **0.09 MB rendered instead of 43.89 MB**: you arrive at the
+prompt at once, rather than waiting for tens of megabytes to redraw at your
+terminal's speed.
 
 ```sh
-amux -s 50000 -a work    # replay the last 50k lines
-amux -s 2m    -a work    # or a byte budget
-amux -s full  -a work    # the whole ring, the slow way
-amux -s none  -a work    # straight to the live prompt
+amux -a agent            # straight to the live prompt, ~10k lines above it
+amux -s 50000 -a agent   # or match your terminal's scrollback exactly
+amux -s none  -a agent   # nothing but the live tail
+amux -s full  -a agent   # everything, the slow way
 ```
 
 Set `-s` to your terminal's own scrollback depth to fill it exactly. No
-terminal reports that number, so it has to be told, not detected. `$AMUX_REPLAY`
-sets the default.
+terminal reports that number, so it has to be told, not detected.
+`$AMUX_REPLAY` sets the default.
 
-**The full history stays reachable.** The ring keeps everything regardless of
-what was replayed:
+## Scroll with your terminal, not against it
+
+`amux` never takes over your screen. It passes the application's bytes through
+untouched and stays on the primary screen, so your scroll wheel and trackpad
+scroll your **terminal's own scrollback** — real selection, real search, real
+copy — instead of being translated into arrow keys inside a copy-mode. Your
+colours are your colours, and there is no prefix key to fight.
+
+That is the tmux trade this fork refuses: no virtualized screen, no recoloured
+output, no reserved status row. The session name goes in the window title via
+OSC 2 instead, which costs zero rows and zero scrollback.
+
+It manages one session, not windows and panes — pair it with
+[dvtm](https://www.brain-dump.org/projects/dvtm) if you want splits.
+
+## Relationship to abduco
+
+`amux` is a fork of [abduco](https://www.brain-dump.org/projects/abduco) 0.6 by
+Marc André Tanner, whose transparent detach/attach model is the reason this
+exists rather than starting from scratch — the hard, correct parts (double-fork
+session creation, socket discovery and permissions, resize propagation) are
+his. The git history here is abduco's, with every upstream commit and author
+intact. This fork is not affiliated with or endorsed by upstream; please report
+`amux` bugs here, not to abduco.
+
+It installs under its own name and keeps its sessions in `~/.amux`, so it sits
+alongside an existing abduco install without conflict.
+
+## What else this fork changes
+
+**The full history stays reachable.** The ring keeps 256 MB per session
+regardless of what was replayed:
 
 ```sh
 amux -H work | less              # page through the whole session
@@ -53,11 +80,6 @@ non-blocking and drained through `select()` write-readiness, with real
 back-pressure: a slow terminal throttles the application through the pty
 instead of melting a core. The input path is queued too, so a large paste into
 an application that has stopped reading its stdin no longer parks the server.
-
-**The host terminal owns the screen.** The alternate-screen wrapper is gone, so
-scrolling and scrollback are your terminal's, natively. The session name goes
-in the window title via OSC 2 — no reserved status row, no scroll region, no
-scrollback cost.
 
 See [DESIGN.md](DESIGN.md) for the reasoning, the invariants, and the measured
 numbers.
@@ -116,10 +138,9 @@ Full details: `man amux`.
 
 ### Coming from abduco
 
-`amux` installs under its own name and keeps its sessions in `~/.amux`, so it
-sits alongside an existing `abduco` without conflict. Your existing abduco
-sessions stay with abduco — the socket directory is derived from the program
-name, so `amux` will not see them.
+Your existing abduco sessions stay with abduco: the socket directory is derived
+from the program name, so `amux` will not see them. Drain them with `abduco`
+before switching, or keep both.
 
 `AMUX_*` environment variables are canonical, but the matching `ABDUCO_*` names
 are still read when the `AMUX_*` one is unset, and `ABDUCO_SESSION` /
@@ -150,6 +171,10 @@ matter who is managing the session.
   same data. It needs flow control above the pty (bracketed paste).
 - The detach key is honoured only as the first byte of a read, as upstream did:
   a `Ctrl+\` appended to a giant paste is data, not a detach.
+- Native scrolling is `amux` getting out of the way, not `amux` providing it.
+  An application that switches to the alternate screen or turns on mouse
+  reporting (vim, less, most full-screen TUIs) claims the wheel for itself,
+  exactly as it would with no session manager in between.
 
 ## License
 
