@@ -5,10 +5,17 @@
 #
 # On each release, update `url` to the new tag and `sha256` to the value in
 # that release's SHA256SUMS for the source tarball (amux-<version>.tar.gz).
+#
+# `url` deliberately points at the release *asset* rather than GitHub's
+# auto-generated /archive/refs/tags/ tarball. GitHub regenerates those on
+# demand, and a change to how it generates them broke sha256 checksums across
+# Homebrew, Nix and others in early 2023; it aims for stability now but does
+# not guarantee it. An uploaded asset is a static file, so its checksum cannot
+# drift -- and it is the one the release workflow already hashes for you.
 class Amux < Formula
   desc "Terminal session manager: detach/attach with full history and fast reattach"
   homepage "https://github.com/errantdata/amux"
-  url "https://github.com/errantdata/amux/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/errantdata/amux/releases/download/v1.0.0/amux-1.0.0.tar.gz"
   sha256 "REPLACE_WITH_SHA256_OF_THE_SOURCE_TARBALL"
   license "ISC"
   head "https://github.com/errantdata/amux.git", branch: "main"

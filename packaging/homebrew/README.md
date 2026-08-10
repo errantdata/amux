@@ -27,7 +27,8 @@ formula builds from source with the project's own `configure`/`make`.
 
 ## On each release
 
-1. Push the tag and let the Release workflow finish.
+1. Push the tag and let the Release workflow finish. The formula points at a
+   release asset, so it can only be published *after* the workflow uploads it.
 2. Take the source tarball's checksum from the release's `SHA256SUMS` — the
    line for `amux-<version>.tar.gz`.
 3. In the tap, update the formula's `url` (new tag) and `sha256`, then commit.
