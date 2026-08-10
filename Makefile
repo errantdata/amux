@@ -40,6 +40,15 @@ check: amux
 	done; \
 	exit $$status
 
+# Re-render the README demo. See demo/README.md.
+demo: amux
+	@command -v vhs >/dev/null 2>&1 || { \
+		echo "vhs is not installed: https://github.com/charmbracelet/vhs"; \
+		echo "  brew install vhs   (or a release binary)"; \
+		exit 1; \
+	}; \
+	vhs demo/reattach.tape
+
 clean:
 	@echo cleaning
 	@rm -f amux amux-*.tar.gz
@@ -75,4 +84,4 @@ uninstall:
 	@echo removing zsh completion file from ${DESTDIR}${SHAREDIR}/zsh/site-functions
 	@rm -f ${DESTDIR}${SHAREDIR}/zsh/site-functions/_amux
 
-.PHONY: all check clean dist install installdirs install-strip install-completion uninstall debug
+.PHONY: all check demo clean dist install installdirs install-strip install-completion uninstall debug
