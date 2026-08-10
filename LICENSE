@@ -1,6 +1,11 @@
 ISC License
 
 Copyright (c) 2013-2018 Marc André Tanner <mat at brain-dump.org>
+Copyright (c) 2026 Sean Cantrell <sean at premiseai.com>
+
+amux is a fork of abduco (https://github.com/martanne/abduco) by Marc André
+Tanner. The original work remains under the terms below, which apply equally
+to the fork's changes.
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above

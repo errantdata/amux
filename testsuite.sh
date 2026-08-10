@@ -1,11 +1,20 @@
 #!/bin/sh
 
-ABDUCO="./abduco"
+AMUX="./amux"
 # set detach key explicitly in case it was changed in config.h
-ABDUCO_OPTS="-e ^\\"
+AMUX_OPTS="-e ^\\"
 
-[ ! -z "$1" ] && ABDUCO="$1"
-[ ! -x "$ABDUCO" ] && echo "usage: $0 /path/to/abduco" && exit 1
+[ ! -z "$1" ] && AMUX="$1"
+[ ! -x "$AMUX" ] && echo "usage: $0 /path/to/amux" && exit 1
+
+# amux switches to passthrough mode when stdin is not a terminal, in which
+# case it emits no prolog/epilog at all and every comparison below fails.
+# Run this under a tty (CI uses tests/*.py instead, which allocate their own).
+if [ ! -t 0 ]; then
+	echo "$0: needs a terminal on stdin; run it from a tty"
+	echo "(for headless/CI use: for t in tests/*.py; do python3 \$t; done)"
+	exit 1
+fi
 
 TESTS_OK=0
 TESTS_RUN=0
@@ -33,38 +42,40 @@ dvtm_session() {
 	dvtm_cmd 'qq'
 }
 
-expected_abduco_prolog() {
-	printf "[?1049h[H"
+# $1 => session-name
+expected_amux_prolog() {
+	printf '\033[r\033[H\033[2J\033[22;2t\033]2;amux: %s\007' "$1"
 }
 
 # $1 => session-name, $2 => exit status
-expected_abduco_epilog() {
-	echo "[?25h[?1049labduco: $1: session terminated with exit status $2"
+expected_amux_epilog() {
+	printf '\033[?25h\033[0m\033[r\033[23;2t'
+	printf 'amux: %s: session terminated with exit status %s\n' "$1" "$2"
 }
 
 # $1 => session-name, $2 => cmd to run
-expected_abduco_attached_output() {
-	expected_abduco_prolog
+expected_amux_attached_output() {
+	expected_amux_prolog "$1"
 	$2
-	expected_abduco_epilog "$1" $?
+	expected_amux_epilog "$1" $?
 }
 
 # $1 => session-name, $2 => cmd to run
-expected_abduco_detached_output() {
-	expected_abduco_prolog
+expected_amux_detached_output() {
+	expected_amux_prolog "$1"
 	$2 >/dev/null 2>&1
-	expected_abduco_epilog "$1" $?
+	expected_amux_epilog "$1" $?
 }
 
 check_environment() {
-	[ "`$ABDUCO | wc -l`" -gt 1 ] && echo Abduco session exists && exit 1;
-	pgrep abduco && echo Abduco process exists && exit 1;
+	[ "`$AMUX | wc -l`" -gt 1 ] && echo "amux session exists" && exit 1;
+	pgrep amux && echo "amux process exists" && exit 1;
 	return 0;
 }
 
 test_non_existing_command() {
 	check_environment || return 1;
-	$ABDUCO -c test ./non-existing-command >/dev/null 2>&1
+	$AMUX -c test ./non-existing-command >/dev/null 2>&1
 	check_environment || return 1;
 }
 
@@ -79,9 +90,9 @@ run_test_attached() {
 
 	TESTS_RUN=$((TESTS_RUN + 1))
 	echo -n "Running test attached: $name "
-	expected_abduco_attached_output "$name" "$cmd" > "$output_expected" 2>&1
+	expected_amux_attached_output "$name" "$cmd" > "$output_expected" 2>&1
 
-	if $ABDUCO -c "$name" $cmd 2>&1 | sed 's/.$//' > "$output" && sleep 1 &&
+	if $AMUX -c "$name" $cmd 2>&1 | sed 's/.$//' > "$output" && sleep 1 &&
 	   diff -u "$output_expected" "$output" && check_environment; then
 		rm "$output" "$output_expected"
 		TESTS_OK=$((TESTS_OK + 1))
@@ -104,10 +115,10 @@ run_test_detached() {
 
 	TESTS_RUN=$((TESTS_RUN + 1))
 	echo -n "Running test detached: $name "
-	expected_abduco_detached_output "$name" "$cmd" > "$output_expected" 2>&1
+	expected_amux_detached_output "$name" "$cmd" > "$output_expected" 2>&1
 
-	if $ABDUCO -n "$name" $cmd >/dev/null 2>&1 && sleep 1 &&
-	   $ABDUCO -a "$name" 2>&1 | sed 's/.$//' > "$output" &&
+	if $AMUX -n "$name" $cmd >/dev/null 2>&1 && sleep 1 &&
+	   $AMUX -a "$name" 2>&1 | sed 's/.$//' > "$output" &&
 	   diff -u "$output_expected" "$output" && check_environment; then
 		rm "$output" "$output_expected"
 		TESTS_OK=$((TESTS_OK + 1))
@@ -131,10 +142,10 @@ run_test_attached_detached() {
 	TESTS_RUN=$((TESTS_RUN + 1))
 	echo -n "Running test: $name "
 	$cmd >/dev/null 2>&1
-	expected_abduco_epilog "$name" $? > "$output_expected" 2>&1
+	expected_amux_epilog "$name" $? > "$output_expected" 2>&1
 
-	if detach | $ABDUCO $ABDUCO_OPTS -c "$name" $cmd >/dev/null 2>&1 && sleep 3 &&
-	   $ABDUCO -a "$name" 2>&1 | tail -1 | sed 's/.$//' > "$output" &&
+	if detach | $AMUX $AMUX_OPTS -c "$name" $cmd >/dev/null 2>&1 && sleep 3 &&
+	   $AMUX -a "$name" 2>&1 | tail -1 | sed 's/.$//' > "$output" &&
 	   diff -u "$output_expected" "$output" && check_environment; then
 		rm "$output" "$output_expected"
 		TESTS_OK=$((TESTS_OK + 1))
@@ -159,7 +170,7 @@ run_test_dvtm() {
 	local output_expected="$name.expected"
 
 	: > "$output_expected"
-	if dvtm_session | $ABDUCO -c "$name" > "$output" 2>&1 &&
+	if dvtm_session | $AMUX -c "$name" > "$output" 2>&1 &&
 	   diff -u "$output_expected" "$output" && check_environment; then
 		rm "$output" "$output_expected"
 		TESTS_OK=$((TESTS_OK + 1))

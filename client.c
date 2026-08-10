@@ -103,7 +103,7 @@ static void client_setup_terminal(void) {
 	 * into this (now native-scrollback) screen. */
 	printf("\033[r\033[H\033[2J");
 	if (server.session_name)
-		printf("\033[22;2t\033]2;mux: %s\007", server.session_name);
+		printf("\033[22;2t\033]2;amux: %s\007", server.session_name);
 	fflush(stdout);
 
 	/* From here the hot path uses non-blocking write()s drained through
@@ -115,6 +115,44 @@ static void client_setup_terminal(void) {
 		fcntl(STDIN_FILENO,  F_SETFL, client_stdin_flags  | O_NONBLOCK);
 	if (client_stdout_flags != -1)
 		fcntl(STDOUT_FILENO, F_SETFL, client_stdout_flags | O_NONBLOCK);
+}
+
+/* amux -H: write the session's full retained history to stdout and exit.
+ * Attaching normally only replays a bounded tail; this is how the rest of the
+ * ring is reached (`amux -H work | less`, or piped to a file). The socket
+ * stays blocking: the server bounds what it queues for us and never waits on
+ * us, so a slow consumer here can neither spin nor stall the session. */
+static int client_dump_history(const char *name) {
+	if ((server.socket = session_connect(name)) == -1)
+		return -1;
+	Packet apkt = {
+		.type = MSG_ATTACH,
+		.u.attach = {
+			.flags = CLIENT_READONLY | CLIENT_HISTORY,
+			.lines = 0,
+			.bytes = UINT64_MAX,   /* everything still retained */
+		},
+		.len = sizeof(apkt.u.attach),
+	};
+	if (write_all(server.socket, (char *)&apkt, packet_size(&apkt)) == -1) {
+		close(server.socket);
+		return -1;
+	}
+
+	int ret = -1;
+	Packet pkt;
+	while (client_recv_packet(&pkt)) {
+		if (pkt.type == MSG_CONTENT) {
+			if (write_all(STDOUT_FILENO, pkt.u.msg, pkt.len) != (ssize_t)pkt.len)
+				break;
+		} else if (pkt.type == MSG_HISTORY_END) {
+			ret = 0;
+			break;
+		}
+		/* MSG_PID and anything else: ignore */
+	}
+	close(server.socket);
+	return ret;
 }
 
 static int client_mainloop(void) {
@@ -130,10 +168,17 @@ static int client_mainloop(void) {
 	client_srv.len = client_srv.off = 0;
 
 	client.need_resize = true;
+	/* Ask for a bounded slice of history (see -s). The server holds the full
+	 * ring either way; replaying more than the terminal can retain would only
+	 * scroll off the top, at the cost of rendering every byte of it first. */
 	Packet apkt = {
 		.type = MSG_ATTACH,
-		.u.i = client.flags,
-		.len = sizeof(apkt.u.i),
+		.u.attach = {
+			.flags = client.flags,
+			.lines = replay_lines,
+			.bytes = replay_bytes,
+		},
+		.len = sizeof(apkt.u.attach),
 	};
 	client_queue_to_server(&apkt);
 
@@ -146,7 +191,12 @@ static int client_mainloop(void) {
 		 * otherwise stop reading and let the server back-pressure the app. */
 		if (buffer_pending(&client_out) < OUTBUF_HIGHWATER)
 			FD_SET(server.socket, &readfds);
-		FD_SET(STDIN_FILENO, &readfds);
+		/* Likewise stop reading stdin once the server has stopped draining
+		 * us, so a firehose (cat big-file | amux -p) back-pressures its
+		 * writer instead of piling up in our memory. The cap is far above
+		 * any interactive paste, so the detach key never waits on it. */
+		if (buffer_pending(&client_srv) < SRCBUF_HIGHWATER)
+			FD_SET(STDIN_FILENO, &readfds);
 		if (buffer_pending(&client_srv) > 0)
 			FD_SET(server.socket, &writefds);
 		if (buffer_pending(&client_out) > 0)

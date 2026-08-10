@@ -1,9 +1,9 @@
-.Dd March 18, 2018
-.Dt ABDUCO 1
-.Os abduco VERSION
+.Dd August 9, 2026
+.Dt AMUX 1
+.Os amux VERSION
 .
 .Sh NAME
-.Nm abduco
+.Nm amux
 .Nd terminal session manager
 .
 .Sh SYNOPSIS
@@ -30,9 +30,16 @@
 .Cm name
 .Cm command Op args ...
 .
+.Nm
+.Fl H
+.Cm name
+.
 .Sh DESCRIPTION
 .
 .Nm
+is a fork of
+.Xr abduco 1 .
+It
 disassociates a given application from its controlling
 terminal, thereby providing roughly the same session attach/detach support as
 .Xr screen 1 ,
@@ -86,6 +93,19 @@ Try to connect to an existing session, upon failure create said session and atta
 Create a new session and attach immediately to it.
 .It Fl n
 Create a new session but do not attach to it.
+.It Fl H
+Write the session's full retained output history to standard output and exit,
+without attaching.
+Attaching replays only a bounded tail of the history
+.Pq see Fl s ;
+this is how the rest of it is reached, for example
+.Pp
+.Dl $ amux -H my-session | less
+.Pp
+The dump never throttles the supervised application, so an unread pager cannot
+stall the session.
+If the session outruns the dump, the oldest bytes are skipped rather than
+delaying the application.
 .El
 .
 .Ss OPTIONS
@@ -115,6 +135,36 @@ options.
 Be quiet, do not print informative messages.
 .It Fl r
 Read-only session, user input is ignored.
+.It Fl s Ar replay
+How much output history to replay into the terminal when attaching.
+The session records all output, including while detached, but pushing more of
+it than the terminal can retain only scrolls off the top -- at the cost of
+rendering every byte of it first, which on a long session means waiting
+minutes before reaching the live prompt.
+Bounding the replay makes an attach land on the live tail immediately.
+.Ar replay
+is one of
+.Bl -tag -width indent -compact
+.It Ar lines
+a plain number: replay the trailing
+.Ar lines
+lines (default 10000)
+.It Ar n Ns Cm k , Ar n Ns Cm m
+a byte budget instead: the trailing
+.Ar n
+KiB or MiB
+.It Cm full
+replay the entire retained history
+.It Cm none
+replay nothing, go straight to live output
+.El
+.Pp
+Set this to your terminal's own scrollback depth to fill it exactly; no
+terminal reports that depth, so it cannot be detected automatically.
+A line count is also capped at 1 KiB per requested line, which bounds the cost
+of pathologically long lines.
+Regardless of this setting the session keeps its full history, reachable with
+.Fl H .
 .It Fl v
 Print version information and exit.
 .El
@@ -137,19 +187,40 @@ Detaches a client.
 .Sh ENVIRONMENT
 .
 .Bl -tag -width indent
-.It Ev ABDUCO_CMD
+.It Ev AMUX_CMD
 If
 .Ic command
 is not specified, the environment variable
-.Ev $ABDUCO_CMD
+.Ev $AMUX_CMD
 is examined, if it is not set
 .Xr dvtm 1
 is executed.
-.It Ev ABDUCO_SESSION
+.It Ev AMUX_REPLAY
+Default value for the
+.Fl s
+option, overridden by an explicit
+.Fl s .
+.It Ev AMUX_SESSION
 The current session name available to the supervised command.
-.It Ev ABDUCO_SOCKET
+.It Ev AMUX_SOCKET
 The absolute path of the session socket available to the supervised command.
 .El
+.Pp
+For compatibility with
+.Xr abduco 1 ,
+from which
+.Nm
+is forked, the corresponding
+.Ev ABDUCO_*
+names are still honoured when the
+.Ev AMUX_*
+one is unset, and
+.Ev ABDUCO_SESSION
+and
+.Ev ABDUCO_SOCKET
+are exported to the supervised command alongside the
+.Ev AMUX_
+versions.
 .Pp
 See the
 .Sx FILES
@@ -161,13 +232,13 @@ All session related information is stored in the following directories (first
 to succeed is used):
 .Bl -bullet
 .It
-.Ev $ABDUCO_SOCKET_DIR/abduco
+.Ev $AMUX_SOCKET_DIR/amux
 .It
-.Ev $HOME/.abduco
+.Ev $HOME/.amux
 .It
-.Ev $TMPDIR/abduco/$USER
+.Ev $TMPDIR/amux/$USER
 .It
-.Ev /tmp/abduco/$USER
+.Ev /tmp/amux/$USER
 .El
 .
 .Pp
@@ -184,7 +255,7 @@ is in
 .Ev $PATH )
 with
 .Pp
-.Dl $ abduco -c my-session
+.Dl $ amux -c my-session
 .Pp
 do some work, then detach by pressing
 .Aq Ctrl+\e ,
@@ -192,29 +263,39 @@ list existing session by running
 .Nm
 without any arguments and later reattach with
 .Pp
-.Dl $ abduco -a my-session
+.Dl $ amux -a my-session
 .Pp
 Alternatively, we can also explicitly specify the command to run.
 .Pp
-.Dl $ abduco -c my-session /bin/sh
+.Dl $ amux -c my-session /bin/sh
 .Pp
 Attach with a
 .Aq Ctrl+z
 as detach key.
 .Pp
-.Dl $ abduco -e ^z -a my-session
+.Dl $ amux -e ^z -a my-session
+.Pp
+Reattach without replaying any history, or with all of it.
+.Pp
+.Dl $ amux -s none -a my-session
+.Dl $ amux -s full -a my-session
+.Pp
+Search the whole recorded history of a running session.
+.Pp
+.Dl $ amux -H my-session | grep -n 'error'
 .Pp
 Send a command to an existing session.
 .Pp
-.Dl $ echo make | abduco -a my-session
+.Dl $ echo make | amux -a my-session
 .Pp
 Or in a slightly more interactive fashion.
 .Pp
-.Dl $ abduco -p my-session
+.Dl $ amux -p my-session
 .Dl make
 .Dl ^D
 .
 .Sh SEE ALSO
+.Xr abduco 1 ,
 .Xr dvtm 1 ,
 .Xr dtach 1 ,
 .Xr tmux 1 ,
@@ -222,5 +303,15 @@ Or in a slightly more interactive fashion.
 .
 .Sh AUTHORS
 .Nm
-is written by
-.An Marc André Tanner Aq mat at brain-dump.org
+is a fork of
+.Xr abduco 1
+by
+.An Marc André Tanner Aq Mt mat@brain-dump.org ,
+maintained by
+.An Sean Cantrell Aq Mt sean@premiseai.com .
+.Pp
+It keeps abduco's transparent detach/attach model and adds non-blocking
+buffered I/O, a full-session history ring with a bounded replay on attach
+.Pq Fl s ,
+and a history dump
+.Pq Fl H .

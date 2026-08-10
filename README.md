@@ -1,185 +1,158 @@
-# abduco a tool for session {at,de}tach support
+# amux — terminal session detach/attach, with history that survives
 
-[abduco](https://www.brain-dump.org/projects/abduco) provides
-session management i.e. it allows programs to be run independently
-from their controlling terminal. That is programs can be detached -
-run in the background - and then later reattached. Together with
-[dvtm](https://www.brain-dump.org/projects/dvtm) it provides a
-simpler and cleaner alternative to tmux or screen.
+`amux` runs a program independently of your terminal: detach, close the
+terminal, come back later, reattach. It is a fork of
+[abduco](https://www.brain-dump.org/projects/abduco) 0.6 by Marc André Tanner,
+and it keeps the thing that makes abduco good — it never redraws your screen —
+while fixing the two problems that made it painful for long-running,
+high-output sessions.
 
-![abduco+dvtm demo](https://raw.githubusercontent.com/martanne/abduco/gh-pages/screencast.gif#center)
+Unlike tmux and screen, `amux` does not virtualize your terminal. It passes the
+application's bytes through untouched, so your colours are your colours, your
+mouse wheel scrolls your terminal's own scrollback, and there is no prefix key
+to fight. It manages one session, not windows and panes — pair it with
+[dvtm](https://www.brain-dump.org/projects/dvtm) if you want splits.
 
-abduco is in many ways very similar to [dtach](http://dtach.sf.net)
-but is a completely independent implementation which is actively maintained,
-contains no legacy code, provides a few additional features, has a
-cleaner, more robust implementation and is distributed under the
-[ISC license](https://raw.githubusercontent.com/martanne/abduco/master/LICENSE)
+## What this fork changes
 
-## News
+**Reattaching is instant, on any size of session.** abduco replays nothing on
+reattach; you come back to a blank screen. `amux` records *all* output —
+including while you were detached — into a 256 MB per-session ring, and on
+attach replays only the trailing part your terminal can actually retain
+(10,000 lines by default). Replaying more than that just scrolls off the top,
+at the cost of rendering every byte first. On a 43.9 MB session that is
+**0.09 MB pushed instead of 43.89 MB** — sub-second instead of minutes.
 
- * [abduco-0.6](https://www.brain-dump.org/projects/abduco/abduco-0.6.tar.gz)
-   [released](https://lists.suckless.org/dev/1603/28589.html) (24.03.2016)
- * [abduco-0.5](https://www.brain-dump.org/projects/abduco/abduco-0.5.tar.gz)
-   [released](https://lists.suckless.org/dev/1601/28094.html) (09.01.2016)
- * [abduco-0.4](https://www.brain-dump.org/projects/abduco/abduco-0.4.tar.gz)
-   [released](https://lists.suckless.org/dev/1503/26027.html) (18.03.2015)
- * [abduco-0.3](https://www.brain-dump.org/projects/abduco/abduco-0.3.tar.gz)
-   [released](https://lists.suckless.org/dev/1502/25557.html) (19.02.2015)
- * [abduco-0.2](https://www.brain-dump.org/projects/abduco/abduco-0.2.tar.gz)
-   [released](https://lists.suckless.org/dev/1411/24447.html) (15.11.2014)
- * [abduco-0.1](https://www.brain-dump.org/projects/abduco/abduco-0.1.tar.gz)
-   [released](https://lists.suckless.org/dev/1407/22703.html) (05.07.2014)
- * [Initial announcement](https://lists.suckless.org/dev/1403/20372.html)
-   on the suckless development mailing list (08.03.2014)
+```sh
+amux -s 50000 -a work    # replay the last 50k lines
+amux -s 2m    -a work    # or a byte budget
+amux -s full  -a work    # the whole ring, the slow way
+amux -s none  -a work    # straight to the live prompt
+```
 
-## Download
+Set `-s` to your terminal's own scrollback depth to fill it exactly. No
+terminal reports that number, so it has to be told, not detected. `$AMUX_REPLAY`
+sets the default.
 
-Either download the latest [source tarball](https://github.com/martanne/abduco/releases),
-compile and install it
+**The full history stays reachable.** The ring keeps everything regardless of
+what was replayed:
 
-    ./configure && make && sudo make install
+```sh
+amux -H work | less              # page through the whole session
+amux -H work | grep -n 'error'   # or search it
+amux -H work > session.log
+```
 
-or use one of the distribution provided
-[binary packages](https://repology.org/project/abduco/packages).
+The dump never throttles the application, so an unread pager cannot stall your
+session.
 
-## Quickstart
+**No more freezing under heavy output.** abduco 0.6 busy-spun on `EAGAIN` when
+a client fell behind, pinning a CPU and stalling the whole loop so output
+trickled out at the terminal's drain rate. Every hot-path fd is now
+non-blocking and drained through `select()` write-readiness, with real
+back-pressure: a slow terminal throttles the application through the pty
+instead of melting a core. The input path is queued too, so a large paste into
+an application that has stopped reading its stdin no longer parks the server.
 
-In order to create a new session `abduco` requires a session name
-as well as an command which will be run. If no command is given
-the environment variable `$ABDUCO_CMD` is examined and if not set
-`dvtm` is executed. Therefore assuming `dvtm` is located somewhere
-in `$PATH` a new session named *demo* is created with:
+**The host terminal owns the screen.** The alternate-screen wrapper is gone, so
+scrolling and scrollback are your terminal's, natively. The session name goes
+in the window title via OSC 2 — no reserved status row, no scroll region, no
+scrollback cost.
 
-    $ abduco -c demo
+See [DESIGN.md](DESIGN.md) for the reasoning, the invariants, and the measured
+numbers.
 
-An arbitrary application can be started as follows:
+## Install
 
-    $ abduco -c session-name your-application
+### Homebrew (macOS and Linux)
 
-`CTRL-\` detaches from the active session. This detach key can be
-changed by means of the `-e` command line option, `-e ^q` would
-for example set it to `CTRL-q`.
+```sh
+brew install errantdata/tap/amux
+```
 
-To get an overview of existing session run `abduco` without any
-arguments.
+### Prebuilt binary
 
-    $ abduco
-    Active sessions (on host debbook)
-    * Thu    2015-03-12 12:05:20    demo-active
-    + Thu    2015-03-12 12:04:50    demo-finished
-      Thu    2015-03-12 12:03:30    demo
+Each [release](https://github.com/errantdata/amux/releases) ships tarballs for
+linux-x86_64, linux-aarch64, macos-arm64 and macos-x86_64, plus `SHA256SUMS`.
 
-A leading asterisk `*` indicates that at least one client is
-connected. A leading plus `+` denotes that the session terminated,
-attaching to it will print its exit status.
+```sh
+tar xzf amux-1.0.0-linux-x86_64.tar.gz
+sudo install -m0755 amux-1.0.0-linux-x86_64/amux /usr/local/bin/amux
+```
 
-A session can be reattached by using the `-a` command line option
-in combination with the session name which was used during session
-creation.
+### From source
 
-    $ abduco -a demo
+Needs a C99 compiler and `make`; nothing else.
 
-If you encounter problems with incomplete redraws or other
-incompatibilities it is recommended to run your applications
-within [dvtm](https://github.com/martanne/dvtm) under abduco:
+```sh
+git clone https://github.com/errantdata/amux
+cd amux
+./configure && make
+sudo make install                 # /usr/local by default
+sudo make install-completion      # optional zsh completion
+```
 
-    $ abduco -c demo dvtm your-application
+Builds and is tested on Linux (glibc and musl), macOS (Apple Silicon and
+Intel), and should work on the BSDs as abduco does.
 
-Check out the manual page for further information and all available
-command line options.
+## Usage
 
-## Improvements over dtach
+```sh
+amux -c work                # create a session and attach
+amux -c work vim            # ...running a specific command
+amux -n build make          # create detached, do not attach
+amux                        # list sessions
+amux -a work                # reattach
+amux -A work htop           # attach, creating it if needed
+```
 
- * **session list**, available by executing `abduco` without any arguments,
-   indicating whether clients are connected or the command has already
-   terminated.
+`Ctrl+\` detaches (`-e ^z` picks another key). A session outlives its clients,
+so closing the terminal — or losing an ssh connection — leaves it running.
 
- * the **session exit status** of the command being run is always kept and
-   reported either upon command termination or on reconnection
-   e.g. the following works:
+Sessions live in `$AMUX_SOCKET_DIR`, else `$HOME/.amux`, else
+`$TMPDIR/amux/$USER`, else `/tmp/amux/$USER`.
 
-        $ abduco -n demo true && abduco -a demo
-        abduco: demo: session terminated with exit status 0
+Full details: `man amux`.
 
- * **read only sessions** if the `-r` command line argument is used when
-   attaching to a session, then all keyboard input is ignored and the
-   client is a passive observer only.
+### Coming from abduco
 
-   Note that this is not a security feature, but only a convenient way to
-   avoid accidental keyboard input.
+`amux` installs under its own name and keeps its sessions in `~/.amux`, so it
+sits alongside an existing `abduco` without conflict. Your existing abduco
+sessions stay with abduco — the socket directory is derived from the program
+name, so `amux` will not see them.
 
-   If you want to make your abduco session available to another user
-   in a read only fashion, use [socat](http://www.dest-unreach.org/socat/)
-   to proxy the abduco socket in a unidirectional (from the abduco server
-   to the client, but not vice versa) way.
+`AMUX_*` environment variables are canonical, but the matching `ABDUCO_*` names
+are still read when the `AMUX_*` one is unset, and `ABDUCO_SESSION` /
+`ABDUCO_SOCKET` are still exported to the supervised command.
 
-   Start your to be shared session, make sure only you have access to
-   the `private` directory:
+## Tests
 
-        $ abduco -c /tmp/abduco/private/session
+```sh
+make check          # headless: allocates its own ptys, what CI runs
+./testsuite.sh      # upstream's byte-exact suite; needs a real tty
+```
 
-   Then proxy the socket in unidirectional mode `-u` to a directory
-   where the desired observers have sufficient access rights:
+`make check` covers I/O integrity under back-pressure, 300k-line throughput,
+exit-status propagation, interactive detach/reattach, history replay windows,
+the `-H` dump, and the queued input path — the last of which measures a bare
+pty as a control, because a pty's ~4 KB input queue discards large pastes no
+matter who is managing the session.
 
-        $ socat -u unix-connect:/tmp/abduco/private/session unix-listen:/tmp/abduco/public/read-only &
+## Limitations
 
-   Now the observers can connect to the read-only side of the socket:
-
-        $ abduco -a /tmp/abduco/public/read-only
-
-   communication in the other direction will not be possible and keyboard
-   input will hence be discarded.
-
- * **better resize handling** on shared sessions, resize request are only
-   processed if they are initiated by the most recently connected, non
-   read only client.
-
- * **socket recreation** by sending the `SIGUSR1` signal to the server
-   process. In case the unix domain socket was removed by accident it
-   can be recreated. The simplest way to find out the server process
-   id is to look for abduco processes which are reparented to the init
-   process.
-
-        $ pgrep -P 1 abduco
-
-   After finding the correct PID the socket can be recreated with
-
-        $ kill -USR1 $PID
-
-   If the abduco binary itself has also been deleted, but a session is
-   still running, use the following command to bring back the session:
-
-        $ /proc/$PID/exe
-
- * **improved socket permissions** the session sockets are by default either
-   stored in `$HOME/.abduco` or `/tmp/abduco/$USER` in both cases it is
-   made sure that only the owner has access to the respective directory.
-
-## Development
-
-You can always fetch the current code base from the git repository
-located at [Github](https://github.com/martanne/abduco/) or
-[Sourcehut](https://git.sr.ht/~martanne/abduco).
-
-If you have comments, suggestions, ideas, a bug report, a patch or something
-else related to abduco then write to the
-[suckless developer mailing list](https://suckless.org/community)
-or contact me directly.
-
-### Debugging
-
-The protocol content exchanged between client and server can be dumped
-to temporary files as follows:
-
-    $ make debug
-    $ ./abduco -n debug [command-to-debug] 2> server-log
-    $ ./abduco -a debug 2> client-log
-
-If you want to run client and server with one command (e.g. using the `-c`
-option) then within `gdb` the option `set follow-fork-mode {child,parent}`
-might be useful. Similarly to get a syscall trace `strace -o abduco -ff
-[abduco-cmd]` proved to be handy.
+- How far you can scroll back after reattaching is capped by your terminal's
+  scrollback setting, not by the ring. The ring keeps 256 MB regardless; use
+  `-H` to reach the rest.
+- `-s` counts newlines in the raw byte stream, not rendered rows, so wrapped
+  lines yield more screen rows than requested.
+- A very large paste loses bytes past the tty's input queue. This is the
+  kernel's tty layer, not `amux` — a bare pty with nothing in between loses the
+  same data. It needs flow control above the pty (bracketed paste).
+- The detach key is honoured only as the first byte of a read, as upstream did:
+  a `Ctrl+\` appended to a giant paste is data, not a detach.
 
 ## License
 
-abduco is licensed under the [ISC license](https://raw.githubusercontent.com/martanne/abduco/master/LICENSE)
+ISC, unchanged from abduco. Copyright (c) 2013-2018 Marc André Tanner for the
+original work; fork changes copyright (c) 2026 Sean Cantrell. See
+[LICENSE](LICENSE).

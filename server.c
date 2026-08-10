@@ -18,6 +18,16 @@ static void client_free(Client *c) {
 	free(c);
 }
 
+/* Remove c from the client list; safe whatever its current position is. */
+static void server_unlink_client(Client *c) {
+	for (Client **p = &server.clients; *p; p = &(*p)->next) {
+		if (*p == c) {
+			*p = c->next;
+			return;
+		}
+	}
+}
+
 static void server_sink_client() {
 	if (!server.clients || !server.clients->next)
 		return;
@@ -88,14 +98,31 @@ static bool server_read_pty(Packet *pkt) {
 	return len > 0;
 }
 
+/* Queue client input for the application. Never blocks: the pty master is
+ * non-blocking and drained via select() write-readiness, so a large paste (or
+ * a piped-in file in passthrough mode) into an application that has stopped
+ * reading its stdin lands here instead of stalling the whole server loop.
+ * The queue is bounded by PTYBUF_HIGHWATER, above which the server stops
+ * reading client sockets and the back-pressure reaches the sender. */
 static bool server_write_pty(Packet *pkt) {
 	print_packet("server-write-pty:", pkt);
-	size_t size = pkt->len;
-	if (write_all(server.pty, pkt->u.msg, size) == size)
-		return true;
-	debug("FAILED\n");
-	server.running = false;
-	return false;
+	if (!buffer_append(&server.pty_out, pkt->u.msg, pkt->len)) {
+		debug("FAILED\n");
+		server.running = false;
+		return false;
+	}
+	return true;
+}
+
+/* Drain queued input into the pty as far as it accepts; never blocks. */
+static void server_flush_pty(void) {
+	if (buffer_pending(&server.pty_out) == 0)
+		return;
+	if (buffer_flush(&server.pty_out, server.pty) == -1) {
+		debug("server-flush-pty: FAILED\n");
+		buffer_free(&server.pty_out);   /* app is gone; drop the backlog */
+		server.running = false;
+	}
 }
 
 /* Queue a packet for delivery to a client; never blocks. For low-priority
@@ -163,6 +190,28 @@ static void server_ring_record(const char *data, size_t len) {
 	server.ring_total += len;
 }
 
+/* Pick a client's starting cursor: walk back from the write head over `lines`
+ * newlines, never further than `bytes` and never past the oldest retained
+ * byte. With lines == 0 the byte budget alone decides (0 = no replay,
+ * UINT64_MAX = everything still retained). Replaying only what the terminal
+ * can actually retain is what makes reattach land on the live prompt at once
+ * instead of rendering the whole ring first. */
+static uint64_t server_ring_replay_start(uint32_t lines, uint64_t bytes) {
+	uint64_t head = server.ring_total;
+	uint64_t limit = head - server_ring_oldest();   /* physically available */
+	if (bytes < limit)
+		limit = bytes;
+	if (lines == 0)
+		return head - limit;
+	uint64_t seen = 0, back = 0;
+	while (back < limit) {
+		if (server.ring[(head - back - 1) % RING_SIZE] == '\n' && ++seen > lines)
+			break;      /* stop *after* the newline closing the older line */
+		back++;
+	}
+	return head - back;
+}
+
 /* Feed a client from the ring (history then live, unified) until its output
  * queue reaches the high-water mark or it has caught up to the write head. */
 static void server_pump_client(Client *c) {
@@ -216,7 +265,10 @@ static Client *server_accept_client(void) {
 		server_mark_socket_exec(true, true);
 	c->socket = newfd;
 	c->state = STATE_CONNECTED;
-	c->ring_pos = server_ring_oldest();   /* replay the full kept history */
+	/* Start at the live head and only rewind once MSG_ATTACH says how much
+	 * history this client wants; a bare probe (session_exists, amux -l)
+	 * therefore never triggers a replay at all. */
+	c->ring_pos = server.ring_total;
 	c->next = server.clients;
 	server.clients = c;
 	server.read_pty = true;
@@ -259,7 +311,10 @@ static bool server_should_read_pty(void) {
 	if (!server.running || !server.read_pty)
 		return false;
 	for (Client *c = server.clients; c; c = c->next) {
-		if (c->flags & CLIENT_LOWPRIORITY)
+		/* Observers and history dumps must never throttle the application:
+		 * `amux -H foo | less` would otherwise freeze the session for as
+		 * long as the pager sits unread. They skip gaps instead. */
+		if (c->flags & (CLIENT_LOWPRIORITY|CLIENT_HISTORY))
 			continue;
 		if (server.ring_total - c->ring_pos > RING_LAG_HIGHWATER)
 			return false;
@@ -273,8 +328,14 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 		server_write_pty(pkt);
 		break;
 	case MSG_ATTACH:
-		c->flags = pkt->u.i;
-		if (c->flags & CLIENT_LOWPRIORITY)
+		c->flags = pkt->u.attach.flags;   /* overlays the legacy u.i */
+		if (pkt->len >= sizeof(pkt->u.attach))
+			c->ring_pos = server_ring_replay_start(pkt->u.attach.lines,
+			                                       pkt->u.attach.bytes);
+		else
+			c->ring_pos = server_ring_oldest();   /* legacy: full replay */
+		c->attach_seen = true;
+		if (c->flags & (CLIENT_LOWPRIORITY|CLIENT_HISTORY))
 			server_sink_client();
 		break;
 	case MSG_RESIZE:
@@ -302,6 +363,7 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 static void server_mainloop(void) {
 	atexit(server_atexit_handler);
 	server_ring_init();
+	server_set_socket_non_blocking(server.pty);
 	bool exit_packet_delivered = false;
 
 	while (server.clients || !exit_packet_delivered) {
@@ -314,9 +376,17 @@ static void server_mainloop(void) {
 		bool read_pty = server_should_read_pty();
 		if (read_pty)
 			FD_SET_MAX(server.pty, &readfds, fdmax);
+		if (buffer_pending(&server.pty_out) > 0)
+			FD_SET_MAX(server.pty, &writefds, fdmax);
+
+		/* Stop soliciting client input while the application is behind on
+		 * reading it; the detach key is handled client side, so detaching
+		 * stays instant even here. */
+		bool pty_backed_up = buffer_pending(&server.pty_out) >= PTYBUF_HIGHWATER;
 
 		for (Client *c = server.clients; c; c = c->next) {
-			FD_SET_MAX(c->socket, &readfds, fdmax);
+			if (!pty_backed_up)
+				FD_SET_MAX(c->socket, &readfds, fdmax);
 			if (buffer_pending(&c->out) > 0)
 				FD_SET_MAX(c->socket, &writefds, fdmax);
 		}
@@ -337,7 +407,9 @@ static void server_mainloop(void) {
 				server_ring_record(server_packet.u.msg, server_packet.len);
 		}
 
-		for (Client **prev_next = &server.clients, *c = server.clients; c;) {
+		for (Client *c = server.clients, *next; c; c = next) {
+			next = c->next;
+
 			/* client input -> us, resilient to partial frames */
 			if (FD_ISSET(c->socket, &readfds)) {
 				if (reader_fill(&c->in, c->socket) < 0) {
@@ -352,21 +424,31 @@ static void server_mainloop(void) {
 				}
 			}
 
-			/* stream ring -> this client (replay history, then live) */
-			if (c->state != STATE_DISCONNECTED)
+			/* Stream ring -> this client (replay history, then live), but
+			 * not before MSG_ATTACH has fixed the replay window: pumping at
+			 * the head first and rewinding afterwards would re-send those
+			 * bytes. A bare probe never attaches and so gets nothing. */
+			if (c->state != STATE_DISCONNECTED && c->attach_seen)
 				server_pump_client(c);
 
-			/* once the app has exited, the status is known, and this client
-			 * has been sent everything, queue a single MSG_EXIT */
-			if (!server.running && !c->exit_queued && server.exit_status != -1 &&
-			    c->ring_pos >= server.ring_total && c->state != STATE_DISCONNECTED) {
-				Packet pkt = {
-					.type = MSG_EXIT,
-					.u.i = server.exit_status,
-					.len = sizeof(pkt.u.i),
-				};
-				server_enqueue_packet(c, &pkt);
-				c->exit_queued = true;
+			/* Terminators, once this client has been sent everything it
+			 * asked for. Gated on attach_seen: a client that has not yet
+			 * told us its replay window must never be finished off early. */
+			if (c->state != STATE_DISCONNECTED && c->attach_seen &&
+			    !c->exit_queued && c->ring_pos >= server.ring_total) {
+				if (c->flags & CLIENT_HISTORY) {
+					Packet pkt = { .type = MSG_HISTORY_END, .len = 0 };
+					server_enqueue_packet(c, &pkt);
+					c->exit_queued = true;
+				} else if (!server.running && server.exit_status != -1) {
+					Packet pkt = {
+						.type = MSG_EXIT,
+						.u.i = server.exit_status,
+						.len = sizeof(pkt.u.i),
+					};
+					server_enqueue_packet(c, &pkt);
+					c->exit_queued = true;
+				}
 			}
 
 			/* opportunistic non-blocking drain */
@@ -374,12 +456,16 @@ static void server_mainloop(void) {
 				server_flush_client(c);
 
 			if (c->state == STATE_DISCONNECTED) {
+				/* Unlink by searching from the head rather than from a
+				 * cached predecessor: handling MSG_ATTACH above may have
+				 * re-ordered the list (server_sink_client), so this client
+				 * is not necessarily where the iteration left it. */
 				bool first = (c == server.clients);
-				Client *t = c->next;
+				next = c->next;
+				server_unlink_client(c);
 				buffer_free(&c->out);
 				buffer_free(&c->in);
 				client_free(c);
-				*prev_next = c = t;
 				if (first && server.clients) {
 					/* promote the next client: make it resize/redraw */
 					Packet pkt = { .type = MSG_RESIZE, .len = 0 };
@@ -388,12 +474,11 @@ static void server_mainloop(void) {
 				} else if (!server.clients) {
 					server_mark_socket_exec(false, true);
 				}
-				continue;
 			}
-
-			prev_next = &c->next;
-			c = c->next;
 		}
+
+		/* hand queued client input to the application, non-blocking */
+		server_flush_pty();
 	}
 
 	exit(EXIT_SUCCESS);

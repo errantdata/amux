@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke/integrity tests for the custom-mux fork of abduco.
+"""Smoke/integrity tests for amux (a fork of abduco 0.6).
 
 Runs the binary under a real PTY (so it does NOT fall into passthrough mode)
 in an isolated socket dir, and checks:
@@ -11,10 +11,27 @@ in an isolated socket dir, and checks:
 """
 import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re, signal
 
-ABDUCO = "/home/seanc/git/abduco/abduco"
+AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
 SOCKDIR = tempfile.mkdtemp(prefix="muxtest.")
-ENV = dict(os.environ, ABDUCO_SOCKET_DIR=SOCKDIR)
+ENV = dict(os.environ, AMUX_SOCKET_DIR=SOCKDIR)
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
+OSC = re.compile(rb'\x1b\][0-9].*?\x07')      # window title: contains "amux: <name>"
+
+def cleanup_sessions():
+    """Kill session servers this test leaves behind. A session whose command
+    finished while detached stays alive on purpose (so you can attach and read
+    its exit status); deleting our socket dir below would orphan those."""
+    try:
+        out = subprocess.run([AMUX], env=ENV, capture_output=True, timeout=10).stdout
+        for line in out.splitlines()[1:]:
+            parts = line.split(b'\t')
+            if len(parts) >= 3 and parts[-2].strip().isdigit():
+                try:
+                    os.kill(int(parts[-2]), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
 
 def set_winsize(fd, rows=40, cols=120):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -55,9 +72,11 @@ def longest_run_from_1(nums):
     return want - 1
 
 def extract_seq(raw):
-    """De-ANSI, drop the abduco epilog line, return the integer tokens."""
-    clean = ANSI.sub(b'', raw)
-    clean = re.sub(rb'abduco:.*', b'', clean)   # epilog status line
+    """De-ANSI, drop the amux epilog line, return the integer tokens."""
+    # strip the OSC title first: it also contains "amux: <name>", and the
+    # epilog filter below would otherwise eat it plus the first line of output
+    clean = ANSI.sub(b'', OSC.sub(b'', raw))
+    clean = re.sub(rb'amux:.*', b'', clean)   # epilog status line
     return [int(x) for x in re.findall(rb'\d+', clean)]
 
 def check(name, ok, detail=""):
@@ -68,7 +87,7 @@ results = []
 
 # ---- Test A: integrity under back-pressure (slow reader) -------------------
 N = 100000
-raw = run_under_pty([ABDUCO, "-c", "tA", "sh", "-c", f"seq 1 {N}; exit 7"],
+raw = run_under_pty([AMUX, "-c", "tA", "sh", "-c", f"seq 1 {N}; exit 7"],
                     reader_delay=0.002, read_chunk=1024)
 nums = extract_seq(raw)
 run = longest_run_from_1(nums)
@@ -80,7 +99,7 @@ results.append(check("A: exit status 7 propagated",
 # ---- Test B: high volume, fast reader --------------------------------------
 N2 = 300000
 t0 = time.time()
-raw2 = run_under_pty([ABDUCO, "-c", "tB", "sh", "-c", f"seq 1 {N2}"],
+raw2 = run_under_pty([AMUX, "-c", "tB", "sh", "-c", f"seq 1 {N2}"],
                      reader_delay=0.0)
 dt = time.time() - t0
 nums2 = extract_seq(raw2)
@@ -89,21 +108,17 @@ results.append(check("B: fast-reader integrity 1..%d" % N2, run2 == N2,
                      f"got contiguous 1..{run2} in {dt:.2f}s"))
 
 # ---- Test C: detached -> attach -> exit status -----------------------------
-subprocess.run([ABDUCO, "-n", "tC", "sh", "-c", "sleep 1; exit 23"],
+subprocess.run([AMUX, "-n", "tC", "sh", "-c", "sleep 1; exit 23"],
                env=ENV, stdin=subprocess.DEVNULL,
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(2)  # let it finish while detached
-raw3 = run_under_pty([ABDUCO, "-a", "tC"])
+raw3 = run_under_pty([AMUX, "-a", "tC"])
 results.append(check("C: attach to finished detached session, status 23",
                      b"exit status 23" in ANSI.sub(b'', raw3)))
 
 # ---- cleanup ---------------------------------------------------------------
-try:
-    for f in os.listdir(SOCKDIR):
-        pass
-    import shutil; shutil.rmtree(SOCKDIR, ignore_errors=True)
-except Exception:
-    pass
+cleanup_sessions()
+import shutil; shutil.rmtree(SOCKDIR, ignore_errors=True)
 
 print("-" * 40)
 print("PASS" if all(results) else "SOME TESTS FAILED")

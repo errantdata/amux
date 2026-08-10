@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
 """Headline test: full history replay on reattach + native (no alt-screen)."""
 import os, pty, time, struct, fcntl, termios, subprocess, tempfile, re, sys
-ABDUCO="/home/seanc/git/abduco/abduco"
-SD=tempfile.mkdtemp(prefix="muxE."); ENV=dict(os.environ,ABDUCO_SOCKET_DIR=SD)
+import signal
+AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
+SD=tempfile.mkdtemp(prefix="muxE."); ENV=dict(os.environ,AMUX_SOCKET_DIR=SD)
 ANSI=re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 OSC=re.compile(rb'\x1b\][0-9].*?\x07')
+def cleanup_sessions():
+    """Kill session servers this test leaves behind. A session whose command
+    finished while detached stays alive on purpose (so you can attach and read
+    its exit status); deleting our socket dir below would orphan those."""
+    try:
+        out = subprocess.run([AMUX], env=ENV, capture_output=True, timeout=10).stdout
+        for line in out.splitlines()[1:]:
+            parts = line.split(b'\t')
+            if len(parts) >= 3 and parts[-2].strip().isdigit():
+                try:
+                    os.kill(int(parts[-2]), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
+
 def set_ws(fd): fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack("HHHH",40,120,0,0))
 def spawn(a):
     m,s=pty.openpty(); set_ws(s)
@@ -32,7 +49,7 @@ def check(n,ok,d=""): print(f"[{'OK ' if ok else 'FAIL'}] {n}"+(f"  {d}" if d el
 
 N=5000
 # session prints N lines then becomes `cat` (stays alive, exits on EOF)
-p1,m1=spawn([ABDUCO,"-e","^\\","-c","tE","sh","-c",f"seq 1 {N}; exec cat"])
+p1,m1=spawn([AMUX,"-e","^\\","-c","tE","sh","-c",f"seq 1 {N}; exec cat"])
 o1=drain(m1,1.5)
 check("E1: first attach shows full output", seqrun(o1)==N, f"run=1..{seqrun(o1)}")
 # no alt-screen wrapper should be emitted by the mux itself
@@ -43,7 +60,7 @@ except Exception: pass
 os.close(m1)
 
 # reattach: the FULL history (1..N) must be replayed
-p2,m2=spawn([ABDUCO,"-e","^\\","-a","tE"])
+p2,m2=spawn([AMUX,"-e","^\\","-a","tE"])
 o2=drain(m2,2.0)
 check("E3: reattach replays full history 1..%d"%N, seqrun(o2)==N, f"run=1..{seqrun(o2)}")
 os.write(m2,b"\x04")                            # EOF -> cat exits 0 -> session ends
@@ -52,6 +69,7 @@ try: rc=p2.wait(timeout=3)
 except Exception: rc="(timeout)"
 check("E4: reattached session exits cleanly (rc=0)", rc==0, f"rc={rc}")
 
+cleanup_sessions()
 import shutil; shutil.rmtree(SD,ignore_errors=True)
 print("-"*40); print("PASS" if all(res) else "SOME TESTS FAILED")
 sys.exit(0 if all(res) else 1)

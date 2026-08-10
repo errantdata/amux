@@ -64,12 +64,13 @@
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 enum PacketType {
-	MSG_CONTENT = 0,
-	MSG_ATTACH  = 1,
-	MSG_DETACH  = 2,
-	MSG_RESIZE  = 3,
-	MSG_EXIT    = 4,
-	MSG_PID     = 5,
+	MSG_CONTENT     = 0,
+	MSG_ATTACH      = 1,
+	MSG_DETACH      = 2,
+	MSG_RESIZE      = 3,
+	MSG_EXIT        = 4,
+	MSG_PID         = 5,
+	MSG_HISTORY_END = 6,   /* server: the requested history has been sent */
 };
 
 typedef struct {
@@ -81,6 +82,14 @@ typedef struct {
 			uint16_t rows;
 			uint16_t cols;
 		} ws;
+		/* MSG_ATTACH payload. `flags` overlays u.i so a short (legacy)
+		 * attach packet is still read correctly; a client that also sends
+		 * lines/bytes asks the server to replay only that much history. */
+		struct {
+			uint32_t flags;
+			uint32_t lines;   /* trailing lines to replay, 0 = use bytes  */
+			uint64_t bytes;   /* byte ceiling on the replay              */
+		} attach;
 		uint32_t i;
 		uint64_t l;
 	} u;
@@ -108,10 +117,12 @@ struct Client {
 	enum {
 		CLIENT_READONLY = 1 << 0,
 		CLIENT_LOWPRIORITY = 1 << 1,
+		CLIENT_HISTORY = 1 << 2,   /* one-shot history dump (amux -H) */
 	} flags;
 	Buffer out;        /* server -> this client, pending output bytes  */
 	Buffer in;         /* this client -> server, partial input frames  */
-	bool exit_queued;  /* MSG_EXIT already appended to out             */
+	bool attach_seen;  /* MSG_ATTACH processed: replay window is set   */
+	bool exit_queued;  /* MSG_EXIT/MSG_HISTORY_END already appended    */
 	uint64_t ring_pos; /* next history byte to send to this client     */
 	Client *next;
 };
@@ -130,6 +141,7 @@ typedef struct {
 	const char *session_name;
 	char host[255];
 	bool read_pty;
+	Buffer pty_out;       /* client input -> application, queued        */
 	char *ring;           /* circular history buffer (mmap or malloc)   */
 	uint64_t ring_total;  /* total bytes ever recorded (monotonic)      */
 } Server;
@@ -144,6 +156,7 @@ static struct sockaddr_un sockaddr = {
 };
 
 static bool set_socket_name(struct sockaddr_un *sockaddr, const char *name);
+static int session_connect(const char *name);
 static void die(const char *s);
 static void info(const char *str, ...);
 
@@ -313,12 +326,65 @@ static int reader_next(Buffer *r, Packet *pkt) {
 /* Output back-pressure thresholds. */
 #define OUTBUF_HIGHWATER   (256 * 1024)      /* throttle the app above this  */
 #define OUTBUF_LOWPRIO_CAP (4 * 1024 * 1024) /* observers go lossy past this */
+#define PTYBUF_HIGHWATER   (256 * 1024)      /* stop reading client input
+                                              * while this much is still
+                                              * queued for the application  */
+#define SRCBUF_HIGHWATER   (4 * 1024 * 1024) /* client stops reading stdin
+                                              * past this much unsent input */
 
 /* Full-history ring: every client streams pty output from its own cursor
- * into this circular buffer, so reattach replays the whole thing. */
+ * into this circular buffer, so reattach replays from anywhere within it. */
 #define RING_SIZE          (256UL * 1024 * 1024) /* history kept per session */
 #define RING_LAG_HIGHWATER (1UL * 1024 * 1024)   /* throttle app if a real
                                                   * client is this far behind */
+
+/* Replay window. Pushing more history than the terminal can retain is pure
+ * wasted render time -- it just scrolls off the top -- so by default a client
+ * replays only the trailing REPLAY_DEFAULT_LINES lines and lands straight on
+ * the live prompt. REPLAY_LINE_BYTES caps the cost of pathologically long
+ * lines; the ring keeps the full RING_SIZE regardless (see amux -H). */
+#define REPLAY_DEFAULT_LINES 10000
+#define REPLAY_LINE_BYTES    1024
+
+/* Replay budget this client requests at attach time (-s / $AMUX_REPLAY). */
+static uint32_t replay_lines = REPLAY_DEFAULT_LINES;
+static uint64_t replay_bytes = (uint64_t)REPLAY_DEFAULT_LINES * REPLAY_LINE_BYTES;
+
+/* Parse a replay spec: "full" | "none" | <lines> | <n>k | <n>m */
+static bool replay_parse(const char *s) {
+	if (!strcmp(s, "full") || !strcmp(s, "all")) {
+		replay_lines = 0;
+		replay_bytes = UINT64_MAX;
+		return true;
+	}
+	if (!strcmp(s, "none")) {
+		replay_lines = 0;
+		replay_bytes = 0;
+		return true;
+	}
+	char *end;
+	errno = 0;
+	unsigned long long v = strtoull(s, &end, 10);
+	if (end == s || errno != 0)
+		return false;
+	if (*end == 'k' || *end == 'K') {
+		replay_lines = 0;
+		replay_bytes = (uint64_t)v * 1024;
+		end++;
+	} else if (*end == 'm' || *end == 'M') {
+		replay_lines = 0;
+		replay_bytes = (uint64_t)v * 1024 * 1024;
+		end++;
+	} else if (*end == '\0') {
+		if (v > UINT32_MAX)
+			return false;
+		replay_lines = (uint32_t)v;
+		replay_bytes = (uint64_t)v * REPLAY_LINE_BYTES;
+	} else {
+		return false;
+	}
+	return *end == '\0';
+}
 
 #include "client.c"
 #include "server.c"
@@ -341,8 +407,24 @@ static void die(const char *s) {
 }
 
 static void usage(void) {
-	fprintf(stderr, "usage: abduco [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-f] [-e detachkey] name command\n");
+	fprintf(stderr, "usage: amux [-a|-A|-c|-n] [-p] [-r] [-q] [-l] [-f] [-e detachkey]\n"
+	                "              [-s replay] name command\n"
+	                "       amux -H name\n"
+	                "\n"
+	                "  -s replay  history replayed on attach: <lines> | <n>k | <n>m |\n"
+	                "             full | none  (default: %d lines, $AMUX_REPLAY)\n"
+	                "  -H         write the session's full retained history to stdout\n",
+	                REPLAY_DEFAULT_LINES);
 	exit(EXIT_FAILURE);
+}
+
+/* Read an AMUX_* setting, falling back to the pre-fork ABDUCO_* name so an
+ * existing shell profile keeps working after the rename. */
+static char *getenv_compat(const char *name, const char *legacy) {
+	char *v = getenv(name);
+	if (!v || !v[0])
+		v = getenv(legacy);
+	return v;
 }
 
 static bool xsnprintf(char *buf, size_t size, const char *fmt, ...) {
@@ -453,7 +535,7 @@ static bool create_socket_dir(struct sockaddr_un *sockaddr) {
 			continue;
 		}
 
-		if (!xsnprintf(sockaddr->sun_path+dirlen, maxlen-dirlen, ".abduco-%d", getpid()))
+		if (!xsnprintf(sockaddr->sun_path+dirlen, maxlen-dirlen, ".amux-%d", getpid()))
 			continue;
 
 		socklen_t socklen = offsetof(struct sockaddr_un, sun_path) + strlen(sockaddr->sun_path) + 1;
@@ -502,6 +584,9 @@ static bool set_socket_name(struct sockaddr_un *sockaddr, const char *name) {
 		strncpy(buf, sockaddr->sun_path, sizeof buf);
 		session_name = basename(buf);
 	}
+	setenv("AMUX_SESSION", session_name, 1);
+	setenv("AMUX_SOCKET", sockaddr->sun_path, 1);
+	/* deprecated aliases, exported so pre-fork scripts keep working */
 	setenv("ABDUCO_SESSION", session_name, 1);
 	setenv("ABDUCO_SOCKET", sockaddr->sun_path, 1);
 
@@ -715,22 +800,36 @@ int main(int argc, char *argv[]) {
 	bool force = false;
 	char **cmd = NULL, action = '\0';
 
-	char *default_cmd[4] = { "/bin/sh", "-c", getenv("ABDUCO_CMD"), NULL };
+	char *default_cmd[4] = { "/bin/sh", "-c", getenv_compat("AMUX_CMD", "ABDUCO_CMD"), NULL };
 	if (!default_cmd[2]) {
-		default_cmd[0] = ABDUCO_CMD;
+		default_cmd[0] = AMUX_CMD;
 		default_cmd[1] = NULL;
 	}
 
 	server.name = basename(argv[0]);
 	gethostname(server.host+1, sizeof(server.host) - 1);
 
-	while ((opt = getopt(argc, argv, "aAclne:fpqrv")) != -1) {
+	const char *replay_env = getenv_compat("AMUX_REPLAY", "ABDUCO_REPLAY");
+	if (replay_env && replay_env[0] && !replay_parse(replay_env)) {
+		fprintf(stderr, "%s: ignoring invalid $AMUX_REPLAY: %s\n",
+		        server.name, replay_env);
+		replay_lines = REPLAY_DEFAULT_LINES;   /* a failed parse may have
+		                                        * already touched these */
+		replay_bytes = (uint64_t)REPLAY_DEFAULT_LINES * REPLAY_LINE_BYTES;
+	}
+
+	while ((opt = getopt(argc, argv, "aAclnHe:fpqrs:v")) != -1) {
 		switch (opt) {
 		case 'a':
 		case 'A':
 		case 'c':
 		case 'n':
+		case 'H':
 			action = opt;
+			break;
+		case 's':
+			if (!optarg || !replay_parse(optarg))
+				usage();
 			break;
 		case 'e':
 			if (!optarg)
@@ -755,7 +854,9 @@ int main(int argc, char *argv[]) {
 			client.flags |= CLIENT_LOWPRIORITY;
 			break;
 		case 'v':
-			puts("abduco-"VERSION" © 2013-2018 Marc André Tanner");
+			puts("amux-"VERSION" — a fork of abduco 0.6\n"
+			     "abduco © 2013-2018 Marc André Tanner\n"
+			     "amux   © 2026 Sean Cantrell");
 			exit(EXIT_SUCCESS);
 		default:
 			usage();
@@ -772,7 +873,7 @@ int main(int argc, char *argv[]) {
 	else
 		cmd = default_cmd;
 
-	if (server.session_name && !isatty(STDIN_FILENO))
+	if (server.session_name && action != 'H' && !isatty(STDIN_FILENO))
 		passthrough = true;
 
 	if (passthrough) {
@@ -780,6 +881,10 @@ int main(int argc, char *argv[]) {
 			action = 'a';
 		quiet = true;
 		client.flags |= CLIENT_LOWPRIORITY;
+		/* a passthrough client discards output entirely, so replaying any
+		 * history to it would be pure waste */
+		replay_lines = 0;
+		replay_bytes = 0;
 	}
 
 	if (!action && !server.session_name)
@@ -798,6 +903,14 @@ int main(int argc, char *argv[]) {
 	}
 
 	server.read_pty = (action == 'n');
+
+	if (action == 'H') {
+		if (client_dump_history(server.session_name) == -1) {
+			info("no such session");
+			return 1;
+		}
+		return 0;
+	}
 
 	redo:
 	switch (action) {

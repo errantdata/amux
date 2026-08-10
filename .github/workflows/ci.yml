@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, custom-mux ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest      # x86_64 glibc
+          - ubuntu-24.04-arm   # aarch64 glibc
+          - macos-latest       # Apple Silicon
+          - macos-13           # Intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: ./configure
+
+      - name: Build
+        run: make
+
+      - name: Version banner
+        run: ./amux -v
+
+      # The build must stay clean under the strict flag set; the fork's own
+      # code is warning-free and regressions here are usually real bugs.
+      - name: Build with warnings as errors
+        run: |
+          make clean
+          make CFLAGS_EXTRA="-Wall -Wextra -pedantic -Werror \
+                             -Wno-unused-parameter -Wno-sign-compare"
+
+      - name: Test
+        run: make check
+
+  alpine:
+    name: alpine (musl)
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: apk add --no-cache build-base python3 linux-headers
+      - name: Configure and build
+        run: ./configure && make
+      - name: Test
+        run: make check

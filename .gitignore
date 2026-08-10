@@ -1,5 +1,7 @@
 /config.h
 /config.mk
+/amux
+# stale builds from before the rename to amux
 /abduco
 *.css
 *.gcda
