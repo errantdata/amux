@@ -20,8 +20,9 @@ session that is **0.09 MB rendered instead of 43.89 MB**: you arrive at the
 prompt at once, rather than waiting for tens of megabytes to redraw at your
 terminal's speed.
 
-![Replaying a 17 MB session in full crawls; the amux default lands on the live
-prompt at once, with the whole history still recorded](demo/reattach.gif)
+![Reattaching to an agent session carrying 17 MB of scrollback: the recent
+transcript and a live agent prompt come back immediately, and amux -H shows all
+2,000,030 lines are still recorded](demo/reattach.gif)
 
 ```sh
 amux -a agent            # straight to the live prompt, ~10k lines above it

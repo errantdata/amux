@@ -27,20 +27,33 @@ CAST = os.path.join(REPO, "demo", "reattach.cast")
 # The last lines of the session: what you actually see on reattach. The bulk
 # above them is cheap filler whose only job is to make the ring big.
 TAIL = [
-    "  ...answering: run the failing test and fix it",
+    "  reading  server.c",
+    "  reading  tests/test_history_replay.py",
     "",
+    "  The replay cursor is compared against ring_total, which moves while",
+    "  the application is still writing. I'll freeze it at attach time.",
+    "",
+    "agent> go ahead",
+    "  ...answering: go ahead",
+    "",
+    "  edit  amux.c          +6 -1",
     "  edit  server.c        +18 -4",
-    "  edit  tests/test_history_replay.py   +11 -0",
+    "  edit  tests/test_large_streams.py   +144 -0",
+    "",
     "  run   make check",
     "",
     "    == tests/test_history_dump.py      PASS",
     "    == tests/test_history_replay.py    PASS",
     "    == tests/test_interactive.py       PASS",
     "    == tests/test_io_integrity.py      PASS",
+    "    == tests/test_large_streams.py     PASS",
     "    == tests/test_pty_input.py         PASS",
     "    == tests/test_replay_window.py     PASS",
     "",
-    "  6 files, 30 checks, 0 failures.",
+    "  7 files, 34 checks, 0 failures.",
+    "",
+    "  Reverting the fix reproduces the stall: 2 of 5 dumps time out.",
+    "  The regression test holds.",
     "",
 ]
 
@@ -195,6 +208,9 @@ def main():
     r.send("\x1c")            # Ctrl+\ detaches
     time.sleep(1.8)
 
+    # the screen keeps what the session left there (no alternate screen);
+    # clear it so the last beat reads cleanly
+    r.run("clear", settle=0.5)
     r.run("# and nothing was thrown away:", settle=0.9)
     r.run("amux -H agent | wc -l", settle=2.4)
     time.sleep(1.2)

@@ -40,14 +40,22 @@ check: amux
 	done; \
 	exit $$status
 
-# Re-render the README demo. See demo/README.md.
-demo: amux
-	@command -v vhs >/dev/null 2>&1 || { \
-		echo "vhs is not installed: https://github.com/charmbracelet/vhs"; \
-		echo "  brew install vhs   (or a release binary)"; \
+# Re-render the README GIF from the committed cast. See demo/README.md.
+AGG_FLAGS ?= --fps-cap 15 --idle-time-limit 1.5 --font-size 15 --theme asciinema
+
+demo:
+	@command -v agg >/dev/null 2>&1 || { \
+		echo "agg is not installed: https://github.com/asciinema/agg"; \
+		echo "  cargo install --git https://github.com/asciinema/agg"; \
+		echo "  (or a release binary from that repository)"; \
 		exit 1; \
 	}; \
-	vhs demo/reattach.tape
+	agg demo/reattach.cast demo/reattach.gif ${AGG_FLAGS}
+
+# Re-record the cast from a live session, then render it.
+demo-record: amux
+	python3 demo/record.py
+	@${MAKE} demo
 
 clean:
 	@echo cleaning
@@ -84,4 +92,4 @@ uninstall:
 	@echo removing zsh completion file from ${DESTDIR}${SHAREDIR}/zsh/site-functions
 	@rm -f ${DESTDIR}${SHAREDIR}/zsh/site-functions/_amux
 
-.PHONY: all check demo clean dist install installdirs install-strip install-completion uninstall debug
+.PHONY: all check demo demo-record clean dist install installdirs install-strip install-completion uninstall debug
