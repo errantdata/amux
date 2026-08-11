@@ -116,9 +116,9 @@ sudo make install-completion      # optional zsh completion
 ```
 
 Needs no dependencies beyond libc: the whole program is one 47 KB binary that
-compiles in a couple of seconds. CI builds and tests it on Linux; macOS builds
-cleanly and its test run is being verified. It should work on the BSDs as
-abduco does.
+compiles in a couple of seconds. CI builds it on Linux and macOS and runs the
+test suite on Linux; macOS is verified by hand, because the test harness itself
+is Linux-only for now. It should work on the BSDs as abduco does.
 
 ## Usage
 
