@@ -92,11 +92,16 @@ numbers.
 
 ### Homebrew (macOS and Linux)
 
+This repository is its own tap — there is no separate `homebrew-*` repo — so
+tap it by URL once, then install:
+
 ```sh
-brew install errantdata/tap/amux
+brew tap errantdata/amux https://github.com/errantdata/amux
+brew install errantdata/amux/amux
 ```
 
 Builds from source, so it works on Apple Silicon, Intel and Linuxbrew alike.
+Upgrades are `brew update && brew upgrade amux` as usual.
 
 ### From source
 

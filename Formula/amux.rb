@@ -1,22 +1,21 @@
 # Homebrew formula for amux.
 #
-# This file lives here for review; Homebrew reads it from a *tap* repository.
-# See packaging/homebrew/README.md for how to publish it.
+# This repository doubles as its own Homebrew tap, so there is no separate
+# homebrew-* repository to maintain. Because the repo is not named
+# `homebrew-amux`, users tap it by URL:
 #
-# On each release, update `url` to the new tag and `sha256` to the value in
-# that release's SHA256SUMS for the source tarball (amux-<version>.tar.gz).
+#   brew tap errantdata/amux https://github.com/errantdata/amux
+#   brew install errantdata/amux/amux
 #
-# `url` points at GitHub's tag archive. An uploaded release asset would have a
-# checksum that can never drift, which is why an earlier version of this file
-# used one -- but that only made sense while a release workflow existed to
-# upload it. Publishing a tarball purely to host it is machinery for its own
-# sake, so: tag archive, and if GitHub ever changes how it generates them
-# (it did once, in early 2023), the fix is to update the sha256 here.
+# On each release: tag, then
+#   curl -sL https://github.com/errantdata/amux/archive/refs/tags/vX.Y.Z.tar.gz \
+#     | shasum -a 256
+# and update `url` and `sha256` below.
 class Amux < Formula
   desc "Terminal session manager: detach/attach with full history and fast reattach"
   homepage "https://github.com/errantdata/amux"
   url "https://github.com/errantdata/amux/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "REPLACE_WITH_SHA256_OF_THE_SOURCE_TARBALL"
+  sha256 "707fa07feb00e3a0871e1b3aba7f0afd339a7a6f56e0c91fb34de2abc6f35e32"
   license "ISC"
   head "https://github.com/errantdata/amux.git", branch: "main"
 
