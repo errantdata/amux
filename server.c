@@ -150,8 +150,8 @@ static void server_flush_client(Client *c) {
 /* ---- full-history ring -------------------------------------------------- *
  * All pty output is appended here (even while detached). Each client holds a
  * monotonic cursor (ring_pos) into the logical byte stream; the last RING_SIZE
- * bytes are physically retained. A reattaching client starts at the oldest
- * retained byte, so it replays the entire kept history before live output. */
+ * bytes are physically retained, and a reattaching client starts as far back
+ * as its replay window reaches. */
 
 static void server_ring_init(void) {
 	server.ring_total = 0;
@@ -188,33 +188,80 @@ static void server_ring_record(const char *data, size_t len) {
 	if (len > first)
 		memcpy(server.ring, data + first, len - first);  /* wrap */
 	server.ring_total += len;
+	term_scan(&server.modes, data, len);
 }
 
-/* Pick a client's starting cursor: walk back from the write head over `lines`
- * newlines, never further than `bytes` and never past the oldest retained
- * byte. With lines == 0 the byte budget alone decides (0 = no replay,
- * UINT64_MAX = everything still retained). Replaying only what the terminal
- * can actually retain is what makes reattach land on the live prompt at once
- * instead of rendering the whole ring first. */
-static uint64_t server_ring_replay_start(uint32_t lines, uint64_t bytes) {
-	uint64_t head = server.ring_total;
-	uint64_t limit = head - server_ring_oldest();   /* physically available */
+/* A cut made on the byte budget alone lands anywhere, including inside an
+ * escape sequence or a UTF-8 character, whose tail would then be printed as
+ * text at the top of the replay. Move it up to the next sequence or line. */
+static uint64_t server_ring_resync(uint64_t pos, uint64_t end) {
+	if (pos == 0)
+		return pos;                   /* the start of the stream, not a cut */
+	uint64_t max = end - pos > REPLAY_RESYNC_BYTES ? pos + REPLAY_RESYNC_BYTES : end;
+	for (uint64_t p = pos; p < max; p++) {
+		char ch = server.ring[p % RING_SIZE];
+		if (ch == '\033' || ch == '\n' || ch == '\r')
+			return p;
+	}
+	return pos;
+}
+
+/* Pick a client's starting cursor: walk back from `end` over `lines` newlines,
+ * never further than `bytes` and never past the oldest retained byte. With
+ * lines == 0 the byte budget alone decides (0 = no replay, UINT64_MAX =
+ * everything still retained). Replaying only what the terminal can actually
+ * retain is what makes reattach land on the live prompt at once instead of
+ * rendering the whole ring first. */
+static uint64_t server_ring_replay_start(uint64_t end, uint32_t lines, uint64_t bytes) {
+	uint64_t limit = end - server_ring_oldest();   /* physically available */
 	if (bytes < limit)
 		limit = bytes;
-	if (lines == 0)
-		return head - limit;
 	uint64_t seen = 0, back = 0;
-	while (back < limit) {
-		if (server.ring[(head - back - 1) % RING_SIZE] == '\n' && ++seen > lines)
-			break;      /* stop *after* the newline closing the older line */
+	while (lines > 0 && back < limit) {
+		if (server.ring[(end - back - 1) % RING_SIZE] == '\n' && ++seen > lines)
+			return end - back;  /* stop *after* the newline closing the older line */
 		back++;
 	}
-	return head - back;
+	return server_ring_resync(end - limit, end);
+}
+
+/* Back up from `end` to just past the previous newline, or to `floor` if there
+ * is none. What an application writes on its way to the alternate screen is
+ * setup, not output: modes, which are tracked anyway, and queries, which a
+ * terminal would answer as if the user had typed the reply. It follows the
+ * last line of real output, so ending a replay on a line boundary drops it. */
+static uint64_t server_ring_line_end(uint64_t end, uint64_t floor) {
+	while (end > floor && server.ring[(end - 1) % RING_SIZE] != '\n')
+		end--;
+	return end;
+}
+
+/* A replay must not begin inside an alternate-screen session that has since
+ * ended: those bytes are repaints of a screen that no longer exists, and a
+ * full-screen application writes so few newlines that the walk back from the
+ * head goes straight through them. If the first alternate-screen sequence in
+ * the window is an exit, the window started inside one: skip past it. */
+static uint64_t server_ring_skip_alt(uint64_t start, uint64_t end) {
+	if (!server.modes.alt_first)
+		return start;                 /* never used it: nothing to find */
+	TermModes window = { .pos = start };
+	while (window.pos < end && !window.alt_first) {
+		size_t off = (size_t)(window.pos % RING_SIZE);
+		size_t chunk = 64 * 1024;
+		if (chunk > end - window.pos)
+			chunk = (size_t)(end - window.pos);
+		if (chunk > RING_SIZE - off)
+			chunk = RING_SIZE - off;      /* don't span the physical wrap */
+		term_scan(&window, server.ring + off, chunk);
+	}
+	return window.alt_first == 'l' ? window.alt_first_end : start;
 }
 
 /* The write head this client is streaming towards. */
 static uint64_t server_client_end(Client *c) {
-	return (c->flags & CLIENT_HISTORY) ? c->history_end : server.ring_total;
+	if (c->flags & CLIENT_HISTORY)
+		return c->history_end;
+	return c->replay_end ? c->replay_end : server.ring_total;
 }
 
 /* Does this client still have ring bytes owed to it? Used to ask select() for
@@ -223,6 +270,42 @@ static uint64_t server_client_end(Client *c) {
  * idle application never wakes it either, stalling the client mid-replay. */
 static bool server_client_owes_data(Client *c) {
 	return c->attach_seen && c->ring_pos < server_client_end(c);
+}
+
+/* Send a client bytes of our own. They set up its terminal and are not part of
+ * the session's history, so they never enter the ring. */
+static void server_send_text(Client *c, const char *text) {
+	Packet pkt = { .type = MSG_CONTENT, .len = strlen(text) };
+	memcpy(pkt.u.msg, text, pkt.len);
+	if (pkt.len > 0)
+		server_enqueue_packet(c, &pkt);
+}
+
+/* Send a client the terminal modes the application has set. */
+static void server_send_modes(Client *c) {
+	char seq[TERM_SEQ_MAX];
+	term_restore(&server.modes, seq);
+	server_send_text(c, seq);
+}
+
+/* The primary-screen history is out, so this terminal can join the application
+ * on the alternate screen. Everything the application has drawn there is left
+ * unsent: those bytes are diffs against a screen this terminal never had, and
+ * a long session holds nothing else (no newlines at all, tens of megabytes of
+ * them, and its startup queries, which a terminal would answer as if typed).
+ * The application holds the real screen, so ask it for that instead. */
+static void server_finish_replay(Client *c) {
+	c->replay_end = 0;
+	server_send_modes(c);
+	if (!server.modes.alt || !server.running) {
+		/* It left during the replay, so that screen is gone for good. */
+		if (c->ring_pos < server.modes.alt_end)
+			c->ring_pos = server.modes.alt_end;
+		return;
+	}
+	c->ring_pos = term_join_pos(&server.modes);
+	if (!(c->flags & CLIENT_PASSTHROUGH))
+		server.redraw_wanted = true;
 }
 
 /* Feed a client from the ring (history then live, unified) until its output
@@ -249,6 +332,120 @@ static void server_pump_client(Client *c) {
 			break;
 		c->ring_pos += chunk;
 	}
+	if (c->replay_end && c->ring_pos >= c->replay_end)
+		server_finish_replay(c);
+}
+
+/* Decide what a newly attached client gets to see. */
+static void server_attach_client(Client *c, Packet *pkt) {
+	/* a short attach packet is what an older client means by a full replay */
+	bool bounded = pkt->len >= sizeof(pkt->u.attach);
+	uint32_t lines = bounded ? pkt->u.attach.lines : 0;
+	uint64_t bytes = bounded ? pkt->u.attach.bytes : UINT64_MAX;
+
+	c->flags = pkt->u.attach.flags;   /* overlays the legacy u.i */
+	c->attach_seen = true;
+	if (c->flags & (CLIENT_LOWPRIORITY|CLIENT_HISTORY))
+		server_sink_client();
+
+	if (c->flags & CLIENT_HISTORY) {
+		c->ring_pos = server_ring_replay_start(server.ring_total, lines, bytes);
+		/* Freeze the end point of a dump at attach time (see history_end). */
+		c->history_end = server.ring_total;
+		return;
+	}
+
+	/* Connected before the application had written a byte, so this client
+	 * has missed nothing and there is nothing to reconstruct, however far
+	 * the application got in the moment it took the attach to arrive: what
+	 * is in the ring is only live output that got here first. */
+	if (c->ring_pos == 0) {
+		server_send_text(c, TERM_CLEAR);
+		return;
+	}
+
+	/* A replay runs up to the live head, unless the application is on the
+	 * alternate screen: then it stops where the application went there. */
+	bool on_alt = server.modes.alt && server.running;
+	uint64_t end = server.ring_total;
+	if (on_alt) {
+		uint64_t floor = server_ring_oldest();
+		end = server.modes.alt_pos > floor ? server.modes.alt_pos : floor;
+		if (end - floor > bytes)
+			floor = end - bytes;
+		end = server_ring_line_end(end, floor);
+	}
+	c->ring_pos = server_ring_skip_alt(server_ring_replay_start(end, lines, bytes), end);
+
+	/* Leave the screen alone if nothing is going to be drawn on it: the user
+	 * gets it back, untouched, when they detach from the alternate screen. */
+	bool replaying = c->ring_pos < end;
+	if (replaying || !on_alt)
+		server_send_text(c, TERM_CLEAR);
+	if (!on_alt)
+		server_send_modes(c);
+	else if (replaying)
+		c->replay_end = end;
+	else
+		server_finish_replay(c);
+}
+
+static uint64_t server_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Make the application repaint its whole screen. SIGWINCH alone will not do:
+ * anything that compares the new size with the old one, which includes every
+ * Node application, ignores a signal that reports no change, and so does an
+ * application with nothing it believes needs drawing. Only a real size change
+ * is sure to work, so take a row away and, once it has reacted, give it back.
+ * tmux does the same thing for the same reason. */
+static void server_redraw_begin(void) {
+	server.redraw_wanted = false;
+	struct winsize ws = server.winsize;
+	ws.ws_row += ws.ws_row > 1 ? -1 : 1;
+	if (ioctl(server.pty, TIOCSWINSZ, &ws) == -1)
+		return;
+	server.redraw_limit = server_now_ms() + REDRAW_TIMEOUT_MS;
+	server.redraw_deadline = server.redraw_limit;
+}
+
+/* Output pushes the end of a repaint back, within limits: see REDRAW_SETTLE_MS. */
+static void server_redraw_output(void) {
+	if (server.redraw_deadline) {
+		uint64_t quiet = server_now_ms() + REDRAW_SETTLE_MS;
+		server.redraw_deadline = quiet < server.redraw_limit ? quiet : server.redraw_limit;
+	}
+}
+
+/* Start or finish a repaint. A client waiting for one may have joined too late
+ * for the round under way, so it gets a round of its own. */
+static void server_redraw_step(void) {
+	if (server.redraw_deadline && server_now_ms() >= server.redraw_deadline) {
+		server.redraw_deadline = 0;
+		ioctl(server.pty, TIOCSWINSZ, &server.winsize);
+	}
+	if (server.redraw_wanted && !server.redraw_deadline)
+		server_redraw_begin();
+}
+
+/* How long select() may sleep. Only a repaint in progress, and a client waiting
+ * for an exit status yet to arrive, need waking up without an event. */
+static struct timeval *server_select_timeout(struct timeval *tv) {
+	uint64_t ms = !server.running && server.clients ? EXIT_POLL_MS : UINT64_MAX;
+	if (server.redraw_deadline) {
+		uint64_t now = server_now_ms();
+		uint64_t left = server.redraw_deadline > now ? server.redraw_deadline - now : 0;
+		if (left < ms)
+			ms = left;
+	}
+	if (ms == UINT64_MAX)
+		return NULL;
+	tv->tv_sec = ms / 1000;
+	tv->tv_usec = (ms % 1000) * 1000;
+	return tv;
 }
 
 static void server_pty_died_handler(int sig) {
@@ -291,8 +488,8 @@ static Client *server_accept_client(void) {
 
 	Packet pkt = {
 		.type = MSG_PID,
-		.len = sizeof pkt.u.l,
-		.u.l = getpid(),
+		.len = sizeof pkt.u.pid,
+		.u.pid = { .pid = getpid(), .caps = SERVER_SETS_UP_SCREEN },
 	};
 	server_enqueue_packet(c, &pkt);
 	server_flush_client(c);
@@ -344,18 +541,7 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 		server_write_pty(pkt);
 		break;
 	case MSG_ATTACH:
-		c->flags = pkt->u.attach.flags;   /* overlays the legacy u.i */
-		if (pkt->len >= sizeof(pkt->u.attach))
-			c->ring_pos = server_ring_replay_start(pkt->u.attach.lines,
-			                                       pkt->u.attach.bytes);
-		else
-			c->ring_pos = server_ring_oldest();   /* legacy: full replay */
-		c->attach_seen = true;
-		/* Freeze the end point of a dump at attach time (see history_end). */
-		if (c->flags & CLIENT_HISTORY)
-			c->history_end = server.ring_total;
-		if (c->flags & (CLIENT_LOWPRIORITY|CLIENT_HISTORY))
-			server_sink_client();
+		server_attach_client(c, pkt);
 		break;
 	case MSG_RESIZE:
 		c->state = STATE_ATTACHED;
@@ -364,7 +550,16 @@ static void server_handle_packet(Client *c, Packet *pkt, bool *exit_delivered) {
 			struct winsize ws = { 0 };
 			ws.ws_row = pkt->u.ws.rows;
 			ws.ws_col = pkt->u.ws.cols;
-			ioctl(server.pty, TIOCSWINSZ, &ws);
+			/* A real change repaints by itself, nothing to force. Going by
+			 * the pty, which may be a row short just now. */
+			struct winsize now;
+			if (ioctl(server.pty, TIOCGWINSZ, &now) == 0 &&
+			    (ws.ws_row != now.ws_row || ws.ws_col != now.ws_col))
+				server.redraw_wanted = false;
+			server.winsize = ws;
+			/* while one row short, server_redraw_step() applies this */
+			if (!server.redraw_deadline)
+				ioctl(server.pty, TIOCSWINSZ, &ws);
 		}
 		kill(-server.pid, SIGWINCH);
 		break;
@@ -410,7 +605,8 @@ static void server_mainloop(void) {
 				FD_SET_MAX(c->socket, &writefds, fdmax);
 		}
 
-		if (select(fdmax+1, &readfds, &writefds, NULL, NULL) == -1) {
+		struct timeval timeout;
+		if (select(fdmax+1, &readfds, &writefds, NULL, server_select_timeout(&timeout)) == -1) {
 			if (errno == EINTR)
 				continue;
 			die("server-mainloop");
@@ -422,8 +618,10 @@ static void server_mainloop(void) {
 		/* live pty output goes into the ring; clients stream from the ring */
 		if (read_pty && FD_ISSET(server.pty, &readfds)) {
 			Packet server_packet;
-			if (server_read_pty(&server_packet))
+			if (server_read_pty(&server_packet)) {
 				server_ring_record(server_packet.u.msg, server_packet.len);
+				server_redraw_output();
+			}
 		}
 
 		for (Client *c = server.clients, *next; c; c = next) {
@@ -496,6 +694,10 @@ static void server_mainloop(void) {
 				}
 			}
 		}
+
+		/* Left until every client has been handled: the resize that usually
+		 * follows an attach may be a real change, and need no forced repaint. */
+		server_redraw_step();
 
 		/* hand queued client input to the application, non-blocking */
 		server_flush_pty();

@@ -163,6 +163,10 @@ Set this to your terminal's own scrollback depth to fill it exactly; no
 terminal reports that depth, so it cannot be detected automatically.
 A line count is also capped at 1 KiB per requested line, which bounds the cost
 of pathologically long lines.
+This bounds output from the primary screen.
+An application on the alternate screen is not replayed at all: its modes are
+restored and it is asked to repaint, by resizing it one row for a moment, so
+that it comes back as it was however much it has drawn.
 Regardless of this setting the session keeps its full history, reachable with
 .Fl H .
 .It Fl v

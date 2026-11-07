@@ -44,12 +44,12 @@ dvtm_session() {
 
 # $1 => session-name
 expected_amux_prolog() {
-	printf '\033[r\033[H\033[2J\033[22;2t\033]2;amux: %s\007' "$1"
+	printf '\033[22;2t\033]2;amux: %s\007\033[r\033[H\033[2J' "$1"
 }
 
 # $1 => session-name, $2 => exit status
 expected_amux_epilog() {
-	printf '\033[?25h\033[0m\033[r\033[23;2t'
+	printf '\033[?25h\033[0m\0337\033[r\0338\033[23;2t'
 	printf 'amux: %s: session terminated with exit status %s\n' "$1" "$2"
 }
 
@@ -63,7 +63,7 @@ expected_amux_attached_output() {
 # $1 => session-name, $2 => cmd to run
 expected_amux_detached_output() {
 	expected_amux_prolog "$1"
-	$2 >/dev/null 2>&1
+	$2 2>&1             # what it wrote while detached is replayed on attach
 	expected_amux_epilog "$1" $?
 }
 
@@ -184,8 +184,14 @@ run_test_dvtm() {
 
 test_non_existing_command || echo "Execution of non existing command FAILED"
 
-run_test_attached "awk" "awk 'BEGIN {for(i=1;i<=1000;i++) print i}'"
-run_test_detached "awk" "awk 'BEGIN {for(i=1;i<=1000;i++) print i}'"
+cat > count.sh <<-'EOT'
+	#!/bin/sh
+	exec awk 'BEGIN {for(i=1;i<=1000;i++) print i}'
+EOT
+chmod +x count.sh
+run_test_attached "count" "./count.sh"
+run_test_detached "count" "./count.sh"
+rm count.sh
 
 run_test_attached "false" "false"
 run_test_detached "false" "false"

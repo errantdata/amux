@@ -90,10 +90,22 @@ typedef struct {
 			uint32_t lines;   /* trailing lines to replay, 0 = use bytes  */
 			uint64_t bytes;   /* byte ceiling on the replay              */
 		} attach;
+		/* MSG_PID payload. `pid` overlays u.l, and `caps` is simply absent
+		 * from an older server, so its length tells a client which it has. */
+		struct {
+			uint64_t pid;
+			uint32_t caps;
+		} pid;
 		uint32_t i;
 		uint64_t l;
 	} u;
 } Packet;
+
+/* What a server does for the clients attaching to it (MSG_PID). */
+#define SERVER_SETS_UP_SCREEN (1 << 0)  /* it clears the screen and restores the
+                                         * application's terminal modes itself */
+
+#include "term.c"
 
 /* Byte queue used for non-blocking, buffered I/O on every hot-path fd
  * (pty<->client sockets, client<->terminal). Pending bytes are data[off..len). */
@@ -118,12 +130,15 @@ struct Client {
 		CLIENT_READONLY = 1 << 0,
 		CLIENT_LOWPRIORITY = 1 << 1,
 		CLIENT_HISTORY = 1 << 2,   /* one-shot history dump (amux -H) */
+		CLIENT_PASSTHROUGH = 1 << 3, /* no terminal behind it (amux -p) */
 	} flags;
 	Buffer out;        /* server -> this client, pending output bytes  */
 	Buffer in;         /* this client -> server, partial input frames  */
 	bool attach_seen;  /* MSG_ATTACH processed: replay window is set   */
 	bool exit_queued;  /* MSG_EXIT/MSG_HISTORY_END already appended    */
 	uint64_t ring_pos; /* next history byte to send to this client     */
+	uint64_t replay_end; /* replay stops here, where the application went
+	                      * to the alternate screen, 0 = follow the head  */
 	uint64_t history_end; /* CLIENT_HISTORY: write head at attach time.
 	                       * A dump is a snapshot: without a fixed end it
 	                       * chases a live writer, so it either stops early
@@ -148,6 +163,10 @@ typedef struct {
 	Buffer pty_out;       /* client input -> application, queued        */
 	char *ring;           /* circular history buffer (mmap or malloc)   */
 	uint64_t ring_total;  /* total bytes ever recorded (monotonic)      */
+	TermModes modes;      /* what the application expects of a terminal */
+	bool redraw_wanted;   /* a client needs the application to repaint  */
+	uint64_t redraw_deadline; /* when to restore the real size, 0 = idle */
+	uint64_t redraw_limit;    /* how far output may push that back      */
 } Server;
 
 static Server server = { .running = true, .exit_status = -1, .host = "@localhost" };
@@ -349,6 +368,21 @@ static int reader_next(Buffer *r, Packet *pkt) {
  * lines; the ring keeps the full RING_SIZE regardless (see amux -H). */
 #define REPLAY_DEFAULT_LINES 10000
 #define REPLAY_LINE_BYTES    1024
+#define REPLAY_RESYNC_BYTES  4096  /* how far a cut made on the byte budget may
+                                    * move to reach a sequence or line boundary */
+
+/* Forcing a repaint (server_redraw_begin): how long to hold the pty one row
+ * off its real size. Long enough for the application to react, which is what
+ * the size change is for: if it wakes only after the size is back it sees no
+ * change at all, and paints nothing. Any output is no sign that it has, since
+ * a spinner keeps ticking regardless, so wait for it to go quiet. */
+#define REDRAW_SETTLE_MS   100   /* quiet for this long: it is done */
+#define REDRAW_TIMEOUT_MS  1000  /* the longest it is ever held     */
+
+/* How often to look for the application's exit status once its pty has closed
+ * and a client is waiting for it. The SIGCHLD that delivers it can land just
+ * before the server blocks, and then nothing would ever wake it. */
+#define EXIT_POLL_MS       50
 
 /* Replay budget this client requests at attach time (-s / $AMUX_REPLAY). */
 static uint32_t replay_lines = REPLAY_DEFAULT_LINES;
@@ -642,6 +676,12 @@ static bool create_session(const char *name, char * const argv[]) {
 			case 0: /* child = user application process */
 				close(server.socket);
 				close(server_pipe[0]);
+				/* -f attaches first, and the mask survives exec: without
+				 * this the application would never hear of a resize */
+				sigset_t winch;
+				sigemptyset(&winch);
+				sigaddset(&winch, SIGWINCH);
+				sigprocmask(SIG_UNBLOCK, &winch, NULL);
 				if (fcntl(client_pipe[1], F_SETFD, FD_CLOEXEC) == 0 &&
 				    fcntl(server_pipe[1], F_SETFD, FD_CLOEXEC) == 0)
 					execvp(argv[0], argv);
@@ -720,6 +760,17 @@ static bool create_session(const char *name, char * const argv[]) {
 	return true;
 }
 
+/* A finished session's server leaves once it has told us the exit status, but
+ * not instantly, and its socket stays taken until it has. */
+static void session_wait_gone(const char *name) {
+	struct timespec tick = { .tv_nsec = 10 * 1000 * 1000 };
+	int fd;
+	for (int i = 0; i < 300 && (fd = session_connect(name)) != -1; i++) {
+		close(fd);
+		nanosleep(&tick, NULL);
+	}
+}
+
 static bool attach_session(const char *name, const bool terminate) {
 	if (server.socket > 0)
 		close(server.socket);
@@ -747,6 +798,7 @@ static bool attach_session(const char *name, const bool terminate) {
 		info("session terminated with exit status %d", status);
 		if (terminate)
 			exit(status);
+		session_wait_gone(name);
 	}
 
 	return terminate;
@@ -884,7 +936,7 @@ int main(int argc, char *argv[]) {
 		if (!action)
 			action = 'a';
 		quiet = true;
-		client.flags |= CLIENT_LOWPRIORITY;
+		client.flags |= CLIENT_LOWPRIORITY|CLIENT_PASSTHROUGH;
 		/* a passthrough client discards output entirely, so replaying any
 		 * history to it would be pure waste */
 		replay_lines = 0;

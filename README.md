@@ -43,6 +43,12 @@ scroll your **terminal's own scrollback** — real selection, real search, real
 copy — instead of being translated into arrow keys inside a copy-mode. Your
 colours are your colours, and there is no prefix key to fight.
 
+An application that manages its own screen — an agent's full-screen TUI, vim,
+less — keeps doing so. Reattach and it comes back the way you left it: `amux`
+restores the alternate screen and mouse reporting it had set and asks it to
+repaint, so the wheel scrolls its transcript from where you left it. Detach and
+your terminal is handed back with all of that undone and your screen as it was.
+
 That is the tmux trade this fork refuses: no virtualized screen, no recoloured
 output, no reserved status row. The session name goes in the window title via
 OSC 2 instead, which costs zero rows and zero scrollback.
@@ -115,10 +121,10 @@ sudo make install                 # /usr/local by default
 sudo make install-completion      # optional zsh completion
 ```
 
-Needs no dependencies beyond libc: the whole program is one 47 KB binary that
+Needs no dependencies beyond libc: the whole program is one 52 KB binary that
 compiles in a couple of seconds. CI builds it on Linux and macOS and runs the
-test suite on Linux; macOS is verified by hand, because the test harness itself
-is Linux-only for now. It should work on the BSDs as abduco does.
+test suite on Linux; on macOS, `make check` is run by hand. It should work on
+the BSDs as abduco does.
 
 ## Usage
 
@@ -158,9 +164,9 @@ make check          # headless: allocates its own ptys, what CI runs
 
 `make check` covers I/O integrity under back-pressure, 300k-line throughput,
 exit-status propagation, interactive detach/reattach, history replay windows,
-the `-H` dump, and the queued input path — the last of which measures a bare
-pty as a control, because a pty's ~4 KB input queue discards large pastes no
-matter who is managing the session.
+reattaching to full-screen applications, the `-H` dump, and the queued input
+path — the last of which measures a bare pty as a control, because a pty's
+~4 KB input queue discards large pastes no matter who is managing the session.
 
 ## Limitations
 
@@ -171,16 +177,22 @@ matter who is managing the session.
   lines yield more screen rows than requested.
 - A very large paste loses bytes past the tty's input queue. This is the
   kernel's tty layer, not `amux` — a bare pty with nothing in between loses the
-  same data. It needs flow control above the pty (bracketed paste). Moderate
-  pastes actually fare *better* through `amux` than through a raw pty, because
-  the queued write path feeds the pty at the rate it will accept rather than
-  flooding it in one call.
+  same data. It needs flow control above the pty (bracketed paste).
 - The detach key is honoured only as the first byte of a read, as upstream did:
   a `Ctrl+\` appended to a giant paste is data, not a detach.
 - Native scrolling is `amux` getting out of the way, not `amux` providing it.
   An application that switches to the alternate screen or turns on mouse
   reporting (vim, less, most full-screen TUIs) claims the wheel for itself,
   exactly as it would with no session manager in between.
+- A full-screen application's screen is not recorded, only asked for: it
+  repaints on reattach because `amux` resizes it by a row for a moment. One that
+  ignores a size change stays blank until it next draws. `-s` bounds output
+  from the primary screen only; `amux -H` still has every raw byte.
+- Keyboard protocols do not cross a reattach. `amux` undoes the kitty protocol
+  and modifyOtherKeys on detach and leaves them off when you come back, so the
+  application gets plain keys and Shift+Enter, say, may stop working.
+- An upgrade does not reach running sessions. Each is served by the binary that
+  started it, for as long as it lives, so restart a session to pick up a fix.
 
 ## License
 

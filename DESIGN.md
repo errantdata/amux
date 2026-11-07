@@ -26,9 +26,12 @@ its socket -> server's non-blocking send hits EAGAIN -> busy-spins, pinning a
 core and stalling the loop -> output trickles out at the terminal's drain rate.
 
 ## Invariants (do not regress)
-1. TRANSPARENT: never parse/rewrite the application's byte stream on the
-   output path. Colors, mouse, scrolling are the host terminal's job, not
-   ours. (Opt-in exception: alt-screen sniffing for the status row, step 3.)
+1. TRANSPARENT: never rewrite the application's byte stream on the output
+   path. Colors, mouse, scrolling are the host terminal's job, not ours.
+   Reading it is allowed: term.c follows what the application asks of the
+   terminal so a terminal attaching later can be told the same (step 5). What
+   that sends is a preamble of our own, ahead of the stream; live output still
+   goes out byte for byte.
 2. NO BUSY-SPIN: every hot-path fd is non-blocking and drained via select
    write-readiness. EAGAIN means "try later", never "loop now".
    Corollary (learned the hard way): ask select() for write readiness whenever
@@ -80,6 +83,51 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
       reading stdin past SRCBUF_HIGHWATER, so `cat big-file | amux -p` can
       no longer be slurped into memory. Note this buys responsiveness, not
       paste integrity: see "Known limitations".
+- [x] Step 5 — terminal state survives reattach:
+      a full-screen application sets the terminal up once and then draws only
+      cursor-addressed diffs. Measured on real agent sessions: 96 MB with zero
+      newlines, alternate screen at offset 137, mouse by 7 MB, and a default
+      replay starting at 85 MB. So a reattached terminal never heard about any
+      of it: it stayed on the primary screen with mouse reporting off, the
+      wheel scrolled the host's scrollback (blank, then whatever came before
+      amux ran), and 10 MB of diffs against a screen it never had drew almost
+      nothing. No amount of replay fixes that, and the ring may no longer hold
+      those bytes at all, so state moved to where it survives:
+      - term.c follows the modes as output is recorded (Server.modes). It only
+        costs anything on escape sequences: about 400 MB/s worst case, end-to-end
+        throughput unchanged. Modes are a list of known ones, not "everything
+        seen": some must not be blindly re-applied (see term_modes).
+      - A terminal attaching gets those modes as a preamble, sent by the server
+        with the clear that the client used to do. That is why the clear moved:
+        with nothing to replay the primary screen is left untouched, and
+        detaching returns it exactly as it was. The preamble states modes that
+        are off too, since a replay can stop between on and off.
+      - The bytes of an alternate-screen session in progress are never
+        replayed. They are diffs that need a screen we don't have, and they
+        contain startup queries a terminal would answer into the application's
+        input. Replay stops at the last newline before the application went
+        there (Client.replay_end), so what it wrote on the way is dropped too;
+        then the client jumps to the live head, or to the start of the sequence
+        the head is in the middle of, and the application repaints. Reattach
+        cost on those sessions: 10 MB -> 2 KB.
+      - None of that applies to a client that connected before the application
+        wrote anything. It has missed nothing, so the ring is just live output
+        that got there first: skipping it would lose a fast application's
+        first frame and leave its queries unanswered.
+      - A repaint needs a real size change. SIGWINCH alone does nothing for
+        anything that compares sizes (all of Node), so the server takes a row
+        away and gives it back, as tmux does. It holds the short size until
+        output goes quiet, up to a limit, not for a fixed time: restoring before
+        a busy application wakes means it sees no change and paints nothing,
+        and a spinner ticking says nothing about whether it has. A client whose
+        own resize is a real change needs no help, and neither do passthrough
+        clients, which have no screen (CLIENT_PASSTHROUGH). One that arrives
+        during a repaint gets another round; it may have missed that one.
+      - The client runs the same tracker over what it has actually written,
+        not what it has queued, and undoes that on detach. Before this a mouse
+        left on printed escape sequences at the user's shell on every wheel
+        notch.
+
 - [x] Status indicator — OSC window title:
       session name written to the terminal title via OSC 2, pushed/popped with
       the title stack (CSI 22/23 t). Zero screen rows, zero colour/scroll
@@ -107,15 +155,33 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
   measures both). The queued write path removes the server stall; delivering a
   huge paste intact needs flow control above the pty (bracketed paste, or an
   app that reads continuously) and is not something a session manager can
-  buffer its way out of. Measured the other way, though, the queued write path
-  helps at moderate sizes: a 1.5 KB paste arrives complete through amux where a
-  bare pty delivers about a fifth of it, because we feed the pty at the rate it
-  accepts instead of in one flooding write.
+  buffer its way out of. Up to at least 6 KB into an application that is
+  reading, amux and a bare pty both deliver everything. (An earlier note here
+  had amux well ahead at 1.5 KB. That was a measuring error: the tty's echo and
+  the application's copy interleave mid-line and read as loss. Measure with
+  echo off.)
 - The detach key is only honoured when it is the first byte of a read, as
   upstream always did — a Ctrl-\ appended to a giant paste is data, not a
   detach. Pressing it as its own keystroke is instant regardless of backlog.
 - Read-side framing errors deliberately close the connection; large input reads
   are chunked to <=4080-byte frames.
+- A full-screen application that ignores a real size change stays blank after a
+  reattach until it next draws: its screen exists only in the application.
+- A replay of primary-screen history can still carry queries, from applications
+  that started and finished inside the window; the terminal answers them and the
+  reply reaches whatever is in the foreground as input. Those of an application
+  still on the alternate screen are never replayed, which is the common case.
+  Removing the rest would mean filtering replayed bytes.
+- Keyboard encoding (the kitty protocol, modifyOtherKeys) is undone on detach
+  and not restored, so an application gets plain keys after a reattach, losing
+  e.g. Shift+Enter. Restoring it would need the kitty stack followed level by
+  level: only its depth is, and only push/pop, not the set form (CSI = u).
+- The detach key is recognised in those encodings too (client_is_detach_key),
+  but only when the whole sequence arrives in one read. One split across reads
+  goes to the application, and pressing the key again works.
+- A running session is served by the binary that started it. A client built
+  after a server copes, and a server that lacks a feature cannot be given one
+  from outside, so session state only improves for sessions started afterwards.
 - A dump (-H) is a snapshot: its end point is the write head as it was when the
   dump attached (Client.history_end). Chasing a live head instead means the
   dump either stops early on a lucky catch-up or never terminates, which is
@@ -133,13 +199,26 @@ core and stalling the loop -> output trickles out at the terminal's drain rate.
 - RING_LAG_HIGHWATER     1 MiB  — throttle the app if a real client lags this far
 - REPLAY_DEFAULT_LINES   10000  — trailing lines replayed on attach (-s)
 - REPLAY_LINE_BYTES      1 KiB  — byte ceiling per requested replay line
+- REPLAY_RESYNC_BYTES    4 KiB  — how far a byte-budget cut may move to reach
+                                  a sequence or line boundary
+- REDRAW_SETTLE_MS      100 ms  — repaint: how quiet the application has to go
+                                  before it gets its real size back
+- REDRAW_TIMEOUT_MS    1000 ms  — repaint: the longest it is held a row short
+- EXIT_POLL_MS           50 ms  — how often to look for an exit status once the
+                                  pty has closed and a client is waiting for it
 
 ## Wire protocol changes
 Framing is unchanged (same Packet header, same 4096-byte frames).
 - MSG_ATTACH payload grew from a bare uint32 flags to {flags, lines, bytes};
   flags still overlays u.i, and a short attach packet is read as "full
   replay", which is what an older client means by it.
+- MSG_PID payload grew from a bare uint64 pid to {pid, caps}; pid still overlays
+  u.l. SERVER_SETS_UP_SCREEN in caps tells a client that the server clears the
+  screen and restores modes; without it, as from a session started by an older
+  build, the client does the clear as it always did.
 - MSG_HISTORY_END (6) is sent to an -H client once the ring has been streamed.
 - CLIENT_HISTORY (1<<2) marks that client: it is never lossy (unlike a
   low-priority observer) but never throttles the application either, so
   `amux -H foo | less` cannot freeze the session behind an unread pager.
+- CLIENT_PASSTHROUGH (1<<3) marks a client with no terminal, which discards
+  output: attaching one must not make the application repaint.

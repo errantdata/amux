@@ -3,8 +3,9 @@ static Buffer client_srv;   /* terminal -> server   (input)            */
 static Buffer client_in;    /* server  -> client    (partial frames)   */
 static int client_stdin_flags  = -1;
 static int client_stdout_flags = -1;
-static bool alt_active = false;  /* the app has switched the real terminal
-                                  * to its alternate screen (?1049/?47/?1047) */
+static TermModes client_modes;   /* what this terminal has actually been sent,
+                                  * and so what detaching has to undo */
+static bool client_term_active;  /* raw mode is on and owed a restore */
 
 static void client_sigwinch_handler(int sig) {
 	client.need_resize = true;
@@ -13,36 +14,6 @@ static void client_sigwinch_handler(int sig) {
 static void client_queue_to_server(Packet *pkt) {
 	print_packet("client-queue:", pkt);
 	buffer_append(&client_srv, (char *)pkt, packet_size(pkt));
-}
-
-/* Track alternate-screen state by sniffing the OUTPUT stream for
- * ESC [ ? <n> (h|l) with n in {47,1047,1049}. A tiny state machine so the
- * sequence may be split across packets. We never rewrite the stream; this is
- * only so detach can return the user's terminal to a sane (primary) screen. */
-static void scan_altscreen(const char *p, size_t n) {
-	static int st = 0;   /* 0 ground, 1 ESC, 2 CSI, 3 CSI? */
-	static int num = 0;
-	for (size_t i = 0; i < n; i++) {
-		unsigned char ch = (unsigned char)p[i];
-		switch (st) {
-		case 0: if (ch == 0x1b) st = 1; break;
-		case 1: st = (ch == '[') ? 2 : (ch == 0x1b ? 1 : 0); break;
-		case 2:
-			if (ch == '?') { st = 3; num = 0; }
-			else st = (ch == 0x1b) ? 1 : 0;
-			break;
-		case 3:
-			if (ch >= '0' && ch <= '9') { num = num * 10 + (ch - '0'); }
-			else {
-				if (num == 1049 || num == 47 || num == 1047) {
-					if (ch == 'h') alt_active = true;
-					else if (ch == 'l') alt_active = false;
-				}
-				st = (ch == 0x1b) ? 1 : 0;
-			}
-			break;
-		}
-	}
 }
 
 /* Blocking control-path read, used by session_exists() on the freshly
@@ -57,9 +28,72 @@ static bool client_recv_packet(Packet *pkt) {
 	return false;
 }
 
+/* Write out what the terminal is owed, and only then count it as sent. Whatever
+ * is still queued on detach never gets there, so a mode it turns off is on. */
+static int client_flush_terminal(void) {
+	size_t pending = buffer_pending(&client_out);
+	if (pending == 0)
+		return 0;
+	const char *data = client_out.data + client_out.off;
+	int ret = buffer_flush(&client_out, STDOUT_FILENO);
+	term_scan(&client_modes, data, pending - buffer_pending(&client_out));
+	return ret;
+}
+
+/* Does this read start with the detach key? Normally that is one byte, but an
+ * application can ask the terminal to encode keys as escape sequences, and it
+ * then stays out of reach unless those are understood too:
+ *
+ *   CSI key[:alternates] [; mods[:event] [; text]] u   kitty keyboard protocol
+ *   CSI 27 ; mods ; key ~                              modifyOtherKeys
+ *
+ * Only a press or repeat counts: a release is not asking for anything. */
+static bool client_is_detach_key(const char *buf, size_t len) {
+	if (buf[0] == KEY_DETACH)
+		return true;
+
+	char seq[32];
+	size_t n = len < sizeof(seq) - 1 ? len : sizeof(seq) - 1;
+	memcpy(seq, buf, n);
+	seq[n] = '\0';
+	if (seq[0] != '\033' || seq[1] != '[')
+		return false;
+
+	char *p = seq + 2;
+	unsigned long key = strtoul(p, &p, 10), mods = 1, event = 1, field3 = 0;
+	while (*p == ':')
+		strtoul(p + 1, &p, 10);
+	if (*p == ';') {
+		mods = strtoul(p + 1, &p, 10);
+		if (*p == ':')
+			event = strtoul(p + 1, &p, 10);
+	}
+	if (*p == ';') {
+		field3 = strtoul(p + 1, &p, 10);
+		while (*p == ':')
+			strtoul(p + 1, &p, 10);
+	}
+	if (*p == '~' && key == 27)
+		key = field3;
+	else if (*p != 'u')
+		return false;
+
+	/* Control keys are reported as the plain key plus Ctrl (bit 2 of mods
+	 * minus one), lower case. Caps and Num Lock (bits 6 and 7) don't matter. */
+	unsigned long want = (unsigned char)KEY_DETACH, ctrl = 0;
+	if (want < 0x20) {
+		want |= 0x40;
+		if (want >= 'A' && want <= 'Z')
+			want += 'a' - 'A';
+		ctrl = 4;
+	}
+	return key == want && ((mods - 1) & ~192ul) == ctrl && event != 3;
+}
+
 static void client_restore_terminal(void) {
-	if (!has_term)
-		return;
+	if (!client_term_active)
+		return;                   /* runs on return and again from atexit */
+	client_term_active = false;
 	if (client_stdin_flags != -1) {
 		fcntl(STDIN_FILENO, F_SETFL, client_stdin_flags);
 		client_stdin_flags = -1;
@@ -68,23 +102,27 @@ static void client_restore_terminal(void) {
 		fcntl(STDOUT_FILENO, F_SETFL, client_stdout_flags);
 		client_stdout_flags = -1;
 	}
-	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
-	/* leave the user's terminal sane: exit any app alternate screen, show the
-	 * cursor, reset attributes and scroll region, pop our window title. */
-	if (alt_active) {
-		printf("\033[?1049l");
-		alt_active = false;
-	}
-	printf("\033[?25h\033[0m\033[r");
+	/* Leave the user's terminal sane: undo what the application turned on,
+	 * show the cursor, reset attributes and scroll region (which homes the
+	 * cursor, hence the save around it: it is back where the user left it),
+	 * pop our window title. All of it before the flush below, so that a mouse
+	 * report already on its way in is discarded, not typed at their shell. */
+	char seq[TERM_SEQ_MAX];
+	term_release(&client_modes, seq);
+	fputs(seq, stdout);
+	printf("\033[?25h\033[0m\0337\033[r\0338");
 	if (server.session_name)
 		printf("\033[23;2t");
 	fflush(stdout);
+	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
 }
 
 static void client_setup_terminal(void) {
 	if (!has_term)
 		return;
 	atexit(client_restore_terminal);
+	client_term_active = true;
+	memset(&client_modes, 0, sizeof client_modes);
 
 	cur_term = orig_term;
 	cur_term.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON|IXOFF);
@@ -97,11 +135,10 @@ static void client_setup_terminal(void) {
 	cur_term.c_cc[VTIME] = 0;
 	tcsetattr(STDIN_FILENO, TCSANOW, &cur_term);
 
-	/* No alternate screen: we stay on the primary screen so the host
-	 * terminal owns scrolling/scrollback. Reset scroll region, clear, and
-	 * push a window-title status. The server then replays the full history
-	 * into this (now native-scrollback) screen. */
-	printf("\033[r\033[H\033[2J");
+	/* No alternate screen of our own: we stay on the primary screen so the
+	 * host terminal owns scrolling/scrollback. Push a window-title status.
+	 * The screen itself waits for the server, which knows what the session
+	 * needs: see the handling of MSG_PID. */
 	if (server.session_name)
 		printf("\033[22;2t\033]2;amux: %s\007", server.session_name);
 	fflush(stdout);
@@ -187,6 +224,21 @@ static int client_mainloop(void) {
 		FD_ZERO(&readfds);
 		FD_ZERO(&writefds);
 
+		/* Before the sets below: a resize queued after them would sit there
+		 * unsent, with nothing asking to wake us, until the next keypress. */
+		if (client.need_resize) {
+			struct winsize ws;
+			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != -1) {
+				Packet rpkt = {
+					.type = MSG_RESIZE,
+					.u = { .ws = { .rows = ws.ws_row, .cols = ws.ws_col } },
+					.len = sizeof(rpkt.u.ws),
+				};
+				client_queue_to_server(&rpkt);
+				client.need_resize = false;
+			}
+		}
+
 		/* Solicit more output only while the terminal is not backed up;
 		 * otherwise stop reading and let the server back-pressure the app. */
 		if (buffer_pending(&client_out) < OUTBUF_HIGHWATER)
@@ -201,19 +253,6 @@ static int client_mainloop(void) {
 			FD_SET(server.socket, &writefds);
 		if (buffer_pending(&client_out) > 0)
 			FD_SET(STDOUT_FILENO, &writefds);
-
-		if (client.need_resize) {
-			struct winsize ws;
-			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != -1) {
-				Packet rpkt = {
-					.type = MSG_RESIZE,
-					.u = { .ws = { .rows = ws.ws_row, .cols = ws.ws_col } },
-					.len = sizeof(rpkt.u.ws),
-				};
-				client_queue_to_server(&rpkt);
-				client.need_resize = false;
-			}
-		}
 
 		if (pselect(server.socket+1, &readfds, &writefds, NULL, NULL, &emptyset) == -1) {
 			if (errno == EINTR)
@@ -234,7 +273,7 @@ static int client_mainloop(void) {
 			} else if (len > 0) {
 				if (KEY_REDRAW && buf[0] == KEY_REDRAW) {
 					client.need_resize = true;
-				} else if (buf[0] == KEY_DETACH) {
+				} else if (client_is_detach_key(buf, len)) {
 					Packet dp = { .type = MSG_DETACH, .len = 0 };
 					client_queue_to_server(&dp);
 					buffer_flush(&client_srv, server.socket);
@@ -266,12 +305,17 @@ static int client_mainloop(void) {
 				int got;
 				while ((got = reader_next(&client_in, &pkt)) == 1) {
 					if (pkt.type == MSG_CONTENT) {
-						if (!passthrough) {
-							scan_altscreen(pkt.u.msg, pkt.len);
+						if (!passthrough)
 							buffer_append(&client_out, pkt.u.msg, pkt.len);
-						}
 					} else if (pkt.type == MSG_RESIZE) {
 						client.need_resize = true;
+					} else if (pkt.type == MSG_PID) {
+						/* A session started by an older build sets nothing up
+						 * for us, and it stays that build until it ends. */
+						bool sets_up = pkt.len >= sizeof(pkt.u.pid) &&
+						               (pkt.u.pid.caps & SERVER_SETS_UP_SCREEN);
+						if (has_term && !sets_up)
+							buffer_append(&client_out, TERM_CLEAR, strlen(TERM_CLEAR));
 					} else if (pkt.type == MSG_EXIT) {
 						client_queue_to_server(&pkt);   /* echo to server */
 						buffer_flush(&client_srv, server.socket);
@@ -279,14 +323,11 @@ static int client_mainloop(void) {
 						 * we are leaving anyway */
 						if (has_term && client_stdout_flags != -1)
 							fcntl(STDOUT_FILENO, F_SETFL, client_stdout_flags);
-						if (buffer_pending(&client_out) > 0)
-							write_all(STDOUT_FILENO,
-							          client_out.data + client_out.off,
-							          buffer_pending(&client_out));
+						client_flush_terminal();
 						close(server.socket);
 						return pkt.u.i;
 					}
-					/* MSG_PID and anything else: ignore */
+					/* anything else: ignore */
 				}
 				if (got < 0)
 					server.running = false;   /* framing error */
@@ -294,8 +335,7 @@ static int client_mainloop(void) {
 		}
 
 		/* drain queues without blocking */
-		if (buffer_pending(&client_out) > 0 &&
-		    buffer_flush(&client_out, STDOUT_FILENO) == -1)
+		if (client_flush_terminal() == -1)
 			server.running = false;
 		if (buffer_pending(&client_srv) > 0 &&
 		    buffer_flush(&client_srv, server.socket) == -1)
