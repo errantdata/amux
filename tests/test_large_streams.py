@@ -21,11 +21,11 @@ Both of these failed before the fixes they guard:
       reproduce the stall above -- an attached client's own traffic keeps
       waking the server loop -- so it is coverage, not a guard.
 """
-import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re
+import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re, select
 import signal, shutil
 
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")
-SD = tempfile.mkdtemp(prefix="muxL.")
+SD = tempfile.mkdtemp(dir="/tmp", prefix="muxL.")
 ENV = dict(os.environ, AMUX_SOCKET_DIR=SD)
 ENV.pop("AMUX_REPLAY", None)
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
@@ -64,7 +64,7 @@ def drain(m, t):
         try:
             d = os.read(m, 1 << 16)
         except BlockingIOError:
-            time.sleep(0.02); continue
+            select.select([m], [], [], 0.02); continue
         except OSError:
             break
         if d: out += d

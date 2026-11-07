@@ -3,7 +3,7 @@
 import os, pty, time, struct, fcntl, termios, subprocess, tempfile, re, signal, sys
 
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
-SD=tempfile.mkdtemp(prefix="muxtestD.")
+SD=tempfile.mkdtemp(dir="/tmp", prefix="muxtestD.")
 ENV=dict(os.environ, AMUX_SOCKET_DIR=SD)
 ANSI=re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 def cleanup_sessions():
@@ -51,10 +51,12 @@ check("D1: input->app->output round-trip", b"round-trip-123" in ANSI.sub(b'',o),
       repr(ANSI.sub(b'',o)[-60:]))
 
 # 2) detach with Ctrl-\ ; the client process must exit, session stays alive
-os.write(m,b"\x1c"); time.sleep(0.5)
-exited = (p.poll() is not None)
-try: p.wait(timeout=3)
-except Exception: pass
+os.write(m,b"\x1c")
+# keep reading: leaving flushes the tty, which on macOS waits for what the client
+# wrote to be read, as a real terminal always would
+end=time.time()+4
+while p.poll() is None and time.time()<end:
+    drain(m,0.1)
 os.close(m)
 check("D2: Ctrl-\\ detaches (client exits, status %r)"%p.returncode, p.poll() is not None)
 alive = subprocess.run([AMUX],env=ENV,capture_output=True,text=True).stdout

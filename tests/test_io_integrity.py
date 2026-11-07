@@ -12,7 +12,7 @@ in an isolated socket dir, and checks:
 import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re, signal
 
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
-SOCKDIR = tempfile.mkdtemp(prefix="muxtest.")
+SOCKDIR = tempfile.mkdtemp(dir="/tmp", prefix="muxtest.")
 ENV = dict(os.environ, AMUX_SOCKET_DIR=SOCKDIR)
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 OSC = re.compile(rb'\x1b\][0-9].*?\x07')      # window title: contains "amux: <name>"

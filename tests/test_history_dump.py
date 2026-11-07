@@ -9,10 +9,11 @@
       unaffected (no stolen resize, no lost output)
 """
 import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re, shutil
+import select
 import signal
 
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
-SD = tempfile.mkdtemp(prefix="muxG.")
+SD = tempfile.mkdtemp(dir="/tmp", prefix="muxG.")
 ENV = dict(os.environ, AMUX_SOCKET_DIR=SD)
 ENV.pop("AMUX_REPLAY", None)
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
@@ -54,7 +55,7 @@ def drain(m, t):
         try:
             d = os.read(m, 65536)
         except BlockingIOError:
-            time.sleep(0.02); continue
+            select.select([m], [], [], 0.02); continue
         except OSError:
             break
         if d: out += d

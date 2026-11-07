@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Headline test: full history replay on reattach + native (no alt-screen)."""
 import os, pty, time, struct, fcntl, termios, subprocess, tempfile, re, sys
+import select
 import signal
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
-SD=tempfile.mkdtemp(prefix="muxE."); ENV=dict(os.environ,AMUX_SOCKET_DIR=SD)
+SD=tempfile.mkdtemp(dir="/tmp", prefix="muxE."); ENV=dict(os.environ,AMUX_SOCKET_DIR=SD)
 ANSI=re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 OSC=re.compile(rb'\x1b\][0-9].*?\x07')
 def cleanup_sessions():
@@ -32,7 +33,7 @@ def drain(m,t):
     fl=fcntl.fcntl(m,fcntl.F_GETFL); fcntl.fcntl(m,fcntl.F_SETFL,fl|os.O_NONBLOCK)
     while time.time()<end:
         try: d=os.read(m,65536)
-        except BlockingIOError: time.sleep(0.02); continue
+        except BlockingIOError: select.select([m],[],[],0.02); continue
         except OSError: break
         if d: out+=d
         else: break

@@ -23,11 +23,12 @@ What the fix does and does not buy:
   H4  a detach keypress is still instant with a backlog queued
 """
 import os, pty, sys, time, struct, fcntl, termios, subprocess, tempfile, re
+import select
 import signal
 import threading, shutil
 
 AMUX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "amux")  # repo-relative: runs anywhere
-SD = tempfile.mkdtemp(prefix="muxH.")
+SD = tempfile.mkdtemp(dir="/tmp", prefix="muxH.")
 ENV = dict(os.environ, AMUX_SOCKET_DIR=SD)
 ENV.pop("AMUX_REPLAY", None)
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
@@ -70,7 +71,7 @@ def drain(m, t):
         try:
             d = os.read(m, 65536)
         except BlockingIOError:
-            time.sleep(0.02); continue
+            select.select([m], [], [], 0.02); continue
         except OSError:
             break
         if d: out += d
@@ -86,14 +87,14 @@ def drain_until_quiet(m, quiet=1.0, ceiling=25.0):
         try:
             d = os.read(m, 1 << 16)
         except BlockingIOError:
-            time.sleep(0.02); continue
+            select.select([m], [], [], 0.02); continue
         except OSError:
             break
         if d:
             out += d; last = time.time()
     return bytes(out)
 
-def wait_ready(m, timeout=20.0):
+def wait_ready(m, timeout=20.0, copies=2):
     """Wait until the application is actually reading its stdin, by sending a
     marker and waiting for it to come back. Sleeping a fixed 0.6s instead is
     what made this race on slow runners."""
@@ -104,11 +105,11 @@ def wait_ready(m, timeout=20.0):
         try:
             d = os.read(m, 1 << 16)
         except BlockingIOError:
-            time.sleep(0.02); continue
+            select.select([m], [], [], 0.02); continue
         except OSError:
             break
         buf += d
-        if buf.count(b"__ready__") >= 2:      # echoed by the tty, then by cat
+        if buf.count(b"__ready__") >= copies: # echoed by the tty, then by cat
             return True
     return b"__ready__" in bytes(buf)
 
@@ -205,15 +206,20 @@ except Exception: rc = "(timeout)"
 check("H2b: session exits cleanly (rc=0)", rc == 0, f"rc={rc}")
 
 # ---- H3: a paste the tty can carry must arrive intact ----------------------
+# With echo off. The tty's echo of the paste and cat's copy of it share one
+# stream and interleave in the middle of lines ("53\r\n51\r\n4\r\n55"), which
+# reads as lost data when every byte is there: 3 runs in 10 flaked on that.
+QUIET_CAT = "stty -echo; exec cat"
+
 def bare_pty_small():
     """The same small paste through a bare pty running cat: the ceiling any
     session manager could possibly deliver."""
     m, s = pty.openpty(); set_ws(s)
-    p = subprocess.Popen(["cat"], stdin=s, stdout=s, stderr=s,
+    p = subprocess.Popen(["sh", "-c", QUIET_CAT], stdin=s, stdout=s, stderr=s,
                          start_new_session=True)
     os.close(s)
     blocking(m)
-    wait_ready(m)
+    wait_ready(m, copies=1)
     os.write(m, small)
     got = longest_run_from_1(nums(drain_until_quiet(m, 1.0, 25.0)))
     try: p.kill()
@@ -223,9 +229,9 @@ def bare_pty_small():
 
 small_control = bare_pty_small()
 
-p3, m3 = spawn([AMUX, "-e", "^\\", "-s", "none", "-c", "tH3", "cat"])
+p3, m3 = spawn([AMUX, "-e", "^\\", "-s", "none", "-c", "tH3", "sh", "-c", QUIET_CAT])
 blocking(m3)
-wait_ready(m3)
+wait_ready(m3, copies=1)
 os.write(m3, small)
 run3 = longest_run_from_1(nums(drain_until_quiet(m3, 1.0, 25.0)))
 check("H3: a %d-byte paste arrives as intact as through a bare pty" % len(small),
@@ -247,13 +253,12 @@ time.sleep(0.5)                       # let the client consume the paste first;
                                       # it starts a read, as upstream always did
 t0 = time.time()
 os.write(m4, b"\x1c")
-try:
-    p4.wait(timeout=SLEEP - 1)
-    detach_dt = time.time() - t0
-    ok = True
-except Exception:
-    detach_dt = time.time() - t0
-    ok = False
+# keep reading: leaving flushes the tty, which on macOS waits for what the client
+# wrote to be read, as a real terminal always would
+while p4.poll() is None and time.time() - t0 < SLEEP - 1:
+    drain(m4, 0.05)
+detach_dt = time.time() - t0
+ok = p4.poll() is not None
 check("H4: detach is instant while input is still queued", ok, f"{detach_dt:.2f}s")
 os.close(m4)
 

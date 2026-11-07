@@ -39,10 +39,10 @@ jobs:
                              -Wmissing-prototypes \
                              -Wno-unused-parameter -Wno-sign-compare"
 
-      # The Python harness does not work on macOS -- amux itself does, verified
-      # by hand: a session created there records and replays its output. Until
-      # the harness is fixed, macOS verifies the build and Linux verifies
-      # behaviour, rather than reporting a red X for a problem in the tests.
+      # `make check` passes on a real Mac, run by hand, but failed on this
+      # runner with empty output, cause unknown. Until that is understood macOS
+      # verifies the build here and Linux verifies behaviour, rather than
+      # reporting a red X for a problem in the tests.
       - name: Test
         if: runner.os == 'Linux'
         run: |
