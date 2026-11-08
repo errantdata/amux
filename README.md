@@ -122,9 +122,8 @@ sudo make install-completion      # optional zsh completion
 ```
 
 Needs no dependencies beyond libc: the whole program is one 52 KB binary that
-compiles in a couple of seconds. CI builds it on Linux and macOS and runs the
-test suite on Linux; on macOS, `make check` is run by hand. It should work on
-the BSDs as abduco does.
+compiles in a couple of seconds. `make check` passes on Linux and macOS, and it
+should work on the BSDs as abduco does.
 
 ## Usage
 
@@ -158,7 +157,7 @@ are still read when the `AMUX_*` one is unset, and `ABDUCO_SESSION` /
 ## Tests
 
 ```sh
-make check          # headless: allocates its own ptys, what CI runs
+make check          # headless: allocates its own ptys
 ./testsuite.sh      # upstream's byte-exact suite; needs a real tty
 ```
 

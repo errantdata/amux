@@ -58,7 +58,7 @@ def write(text):
     while data:
         data = data[os.write(1, data):]
 def size():
-    return struct.unpack("HH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 4))
+    return struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))[:2]  # winsize is 8 bytes
 LINES = ["transcript line %05d" % i for i in range(2000)]
 rows, cols = size()
 top = len(LINES)
@@ -218,7 +218,14 @@ class App:
         boot.proc.wait(timeout=10)
         boot.pump(0.05)
         boot.close()
-        self.wait_for("ready", 60)
+        if not self.wait_for("ready", 60):
+            # say why here, rather than as every later check failing blind
+            listing = subprocess.run([AMUX], env=ENV, capture_output=True, timeout=10)
+            screen = subprocess.run([AMUX, "-H", self.name], env=ENV, capture_output=True, timeout=10)
+            check(f"{self.name}: the application starts", False,
+                  f"exit={boot.proc.returncode} boot={bytes(boot.out)[-300:]!r} "
+                  f"log={self.lines()[-5:]!r} sessions={listing.stdout + listing.stderr!r} "
+                  f"screen={(screen.stdout + screen.stderr)[-400:]!r}")
         time.sleep(0.15)                 # let the server drain the last of it
 
     def lines(self):

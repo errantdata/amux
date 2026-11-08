@@ -9,10 +9,10 @@ AMUX_OPTS="-e ^\\"
 
 # amux switches to passthrough mode when stdin is not a terminal, in which
 # case it emits no prolog/epilog at all and every comparison below fails.
-# Run this under a tty (CI uses tests/*.py instead, which allocate their own).
+# Run this under a tty (make check runs tests/*.py, which allocate their own).
 if [ ! -t 0 ]; then
 	echo "$0: needs a terminal on stdin; run it from a tty"
-	echo "(for headless/CI use: for t in tests/*.py; do python3 \$t; done)"
+	echo "(headless: make check)"
 	exit 1
 fi
 

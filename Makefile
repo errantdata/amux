@@ -30,7 +30,7 @@ debug: clean
 	make CFLAGS_EXTRA='${CFLAGS_DEBUG}'
 
 # The Python suite allocates its own pseudo terminals, so it runs headless
-# (in CI, over ssh, anywhere). testsuite.sh instead compares byte-exact
+# (over ssh, anywhere). testsuite.sh instead compares byte-exact
 # terminal output and therefore needs a real tty on stdin; run it by hand.
 check: amux
 	@status=0; \
