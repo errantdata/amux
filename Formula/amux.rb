@@ -14,8 +14,8 @@
 class Amux < Formula
   desc "Terminal session manager: detach/attach with full history and fast reattach"
   homepage "https://github.com/errantdata/amux"
-  url "https://github.com/errantdata/amux/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "707fa07feb00e3a0871e1b3aba7f0afd339a7a6f56e0c91fb34de2abc6f35e32"
+  url "https://github.com/errantdata/amux/archive/refs/tags/v1.0.1.tar.gz"
+  sha256 "bd9ad3902e865f5cc1fdb8b5c399fdb260c1441ea77245472e27098840ba4b03"
   license "ISC"
   head "https://github.com/errantdata/amux.git", branch: "main"
 
