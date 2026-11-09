@@ -1,6 +1,6 @@
 -include config.mk
 
-VERSION = 1.0.0
+VERSION = 1.0.1
 
 CFLAGS_STD ?= -std=c99 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -DNDEBUG
 CFLAGS_STD += -DVERSION=\"${VERSION}\"
@@ -82,7 +82,8 @@ install-strip: install
 
 install-completion:
 	@echo installing zsh completion file to ${DESTDIR}${SHAREDIR}/zsh/site-functions
-	@install -Dm644 contrib/amux.zsh ${DESTDIR}${SHAREDIR}/zsh/site-functions/_amux
+	@${INSTALL} -d ${DESTDIR}${SHAREDIR}/zsh/site-functions
+	@${INSTALL} -m 644 contrib/amux.zsh ${DESTDIR}${SHAREDIR}/zsh/site-functions/_amux
 
 uninstall:
 	@echo removing executable file from ${DESTDIR}${PREFIX}/bin
